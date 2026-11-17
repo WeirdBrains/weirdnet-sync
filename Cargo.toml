@@ -1,0 +1,24 @@
+[package]
+name = "weirdnet-sync"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Weirdnet sync: hybrid logical clocks, an op log, LWW and OR-set merge, tombstone GC, SyncKey page sealing, a device roster with self-cert and revocation, and the weirdnet-sync/v1 pull protocol over weirdnet-net."
+authors = ["m3talsmith <m3talsmith@gmail.com>"]
+license = "BSD-3-Clause"
+repository = "https://github.com/WeirdBrains/weirdnet-sync"
+documentation = "https://docs.rs/weirdnet-sync"
+readme = "README.md"
+keywords = ["p2p", "crdt", "sync", "replication", "weirdnet"]
+categories = ["network-programming", "data-structures"]
+include = ["src/**", "README.md", "SECURITY.md", "CHANGELOG.md", "LICENSE"]
+
+[dependencies]
+cbor4ii = { version = "1.2", features = ["serde1", "use_std"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+weirdnet-keys = { version = "0.1.0", default-features = false }
+weirdnet-net = "0.5.0"
+zeroize = "1"
+

@@ -1,0 +1,29 @@
+//! Linked-device sync: clocks, an op log, merge primitives, sealed pages, a roster and
+//! the `weirdnet-sync/v1` protocol over [`weirdnet-net`].
+//!
+//! Record types (bookmarks, notes, and so on) stay in the application. Persistence stays
+//! in the application too; [`OpLog`] is the in-memory log the app can snapshot.
+#![forbid(unsafe_code)]
+
+pub mod hlc;
+pub mod log;
+pub mod merge;
+pub mod net;
+pub mod protocol;
+pub mod roster;
+pub mod seal;
+
+mod bytes;
+mod error;
+
+pub use error::{Result, SyncError};
+pub use hlc::{Hlc, NodeId};
+pub use log::{LogEntry, OpLog, Page as LogPage};
+pub use merge::{CONFLICT_KEEP_MS, Lww, OrSet, TOMBSTONE_GC_MS, can_gc_tombstone, edit_vs_delete, folder_cycle, lww};
+pub use net::{SyncHandler, SyncState, node_config, pull_from, start_node};
+pub use protocol::{
+    Ack, Cursors, Envelope, Hello, HelloOk, Message, PAGE_MAX, PROTOCOL, Page, Pull, Refuse, RefuseReason, RosterMsg, SYNC_PROFILE, decode,
+    decode_framed, encode, encode_framed,
+};
+pub use roster::{Roster, SessionCheck, SessionOffer};
+pub use seal::{SyncKey, SyncType, open_page, page_aad, seal_page, sync_key, sync_key_info};
