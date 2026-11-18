@@ -10,6 +10,7 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 - Key rotation on revoke: `SyncState::revoke` makes a random epoch key sealed to each remaining device, so a revoked device that holds the seed cannot read later ops.
 - Re-admission: a device restored from the recovery words reports `needs-admission` until a member device admits it (`SyncState::admit`, or `approve` before its device key is known); it then gets the current and older epoch keys.
+- Automatic first rotation after the first link and after upgrading from seed-only keys, once every device has a device key (`auto_first_rotation`, `first_rotation_due`, `rotate_if_first_due`), and `devices_without_key` for a pre-revoke warning.
 - `DeviceKey`, `Rotation`, `Admission`, `KeyChain` (in `Roster::chain`), `EpochKeys`, `KeyStatus`, `SyncState::new`, `key_status`, `rotate`, `refresh_keys`, `approve`, `admit_approved` and `take_keys_from`.
 
 ### Changed

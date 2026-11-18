@@ -539,6 +539,35 @@ impl SyncState {
         self.key_status() == KeyStatus::NeedsAdmission
     }
 
+    /// Active devices that have not published a device key yet (not upgraded, or not
+    /// synced since). A rotation now leaves them out; they would need re-admission.
+    /// Apps warn before revoking while this is not empty.
+    pub fn devices_without_key(&self) -> Vec<NodeCert> {
+        self.roster.active().filter(|c| self.roster.chain.device(&c.peer_id).is_none_or(|d| !d.verify())).cloned().collect()
+    }
+
+    /// The first rotation should happen now, on this device: there is no rotation yet,
+    /// at least two devices are linked, every active device has published its device
+    /// key, and this device has the lowest peer id among them (so only one device
+    /// starts the chain). Covers both "right after the first link" and "once after an
+    /// upgrade from seed-only keys". [`crate::pull_from`] does it when
+    /// [`SyncState::auto_first_rotation`] is on; apps may also call
+    /// [`SyncState::rotate_if_first_due`].
+    pub fn first_rotation_due(&self) -> bool {
+        let Some(device) = &self.device else { return false };
+        if self.key_status() != KeyStatus::Seed {
+            return false;
+        }
+        let active: Vec<&NodeCert> = self.roster.active().collect();
+        let me = device.peer_id();
+        active.len() >= 2 && active.iter().any(|c| c.peer_id == me) && self.devices_without_key().is_empty() && active.iter().all(|c| c.peer_id >= me)
+    }
+
+    /// Make the first rotation if [`SyncState::first_rotation_due`]. Returns its id.
+    pub fn rotate_if_first_due(&mut self, at_ms: i64) -> Result<Option<String>> {
+        if self.first_rotation_due() { self.rotate(at_ms).map(Some) } else { Ok(None) }
+    }
+
     /// The head has a revoked member and this device can replace it.
     pub fn needs_rotation(&self) -> bool {
         let view = self.roster.chain_view();

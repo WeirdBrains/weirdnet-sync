@@ -28,6 +28,10 @@ pub struct SyncState {
     pub device: Option<Device>,
     /// Rotated epoch keys this device holds (secret; persist encrypted).
     pub keys: EpochKeys,
+    /// Make the first rotation automatically once it is due (see
+    /// [`SyncState::first_rotation_due`]): right after the first link, and once after an
+    /// upgrade from seed-only keys. On in [`SyncState::new`].
+    pub auto_first_rotation: bool,
 }
 
 impl SyncState {
@@ -49,6 +53,7 @@ impl SyncState {
             clock: None,
             device,
             keys: EpochKeys::new(),
+            auto_first_rotation: true,
         };
         if st.device.is_some() {
             st.publish_device_key(st.our_cert.issued_at)?;
@@ -340,7 +345,11 @@ pub fn pull_from(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: Pee
         }
     }
     observe(state, now_ms());
-    if state.needs_rotation() {
+    if state.auto_first_rotation && state.first_rotation_due() {
+        // Linked devices still on seed-derived keys, all with device keys: start the
+        // chain while every device is trusted.
+        state.rotate(now_ms() as i64)?;
+    } else if state.needs_rotation() {
         // The head still includes a device that has since been revoked (say, revoked
         // on a device without a node key): replace it.
         state.rotate(now_ms() as i64)?;
@@ -408,6 +417,7 @@ mod tests {
             clock: None,
             device: Some(Device::from_node_key(node_key).unwrap()),
             keys: EpochKeys::new(),
+            auto_first_rotation: false,
         };
         let mut st = st;
         st.publish_device_key(1).unwrap();
@@ -829,5 +839,92 @@ mod tests {
         pull(a, b).unwrap();
         assert_eq!(head(a).as_deref(), Some(h.as_str()));
         assert!(!a.0.lock().unwrap().roster.chain_view().head().unwrap().members.contains(&peer(c)));
+    }
+
+    #[test]
+    fn the_first_rotation_starts_once_every_linked_device_has_a_key() {
+        let user = Keypair::generate_ed25519();
+        let uid = user::user_id(&user.public());
+        let (ka, kb) = (Keypair::generate_ed25519(), Keypair::generate_ed25519());
+        let (sa, _) = state(&user, &ka, &uid, "a", &["bookmarks"]);
+        let (sb, _) = state(&user, &kb, &uid, "b", &["bookmarks"]);
+        for s in [&sa, &sb] {
+            s.lock().unwrap().auto_first_rotation = true;
+        }
+        assert!(!sa.lock().unwrap().first_rotation_due(), "one device: nothing to rotate for");
+        let a = (sa.clone(), start_node(ka, node_config(true), sa.clone()).unwrap());
+        let b = (sb.clone(), start_node(kb, node_config(true), sb.clone()).unwrap());
+        // The first link: each learns the other's cert, not yet its device key.
+        let (ca, cb) = (sa.lock().unwrap().our_cert.clone(), sb.lock().unwrap().our_cert.clone());
+        sa.lock().unwrap().roster.upsert(cb);
+        sb.lock().unwrap().roster.upsert(ca);
+        for s in [&sa, &sb] {
+            let st = s.lock().unwrap();
+            assert!(!st.first_rotation_due());
+            assert_eq!(st.devices_without_key().len(), 1, "the other device has no key yet");
+        }
+        let (low, high) = if peer(&a) < peer(&b) { (&a, &b) } else { (&b, &a) };
+        sa.lock().unwrap().local_op(1, typ::BOOKMARKS, "a-1", vec![1]);
+        // The higher peer pulls first: it learns the lower one's key, but leaves the
+        // first rotation to it.
+        pull(high, low).unwrap();
+        assert_eq!(head(high), None);
+        assert!(low.0.lock().unwrap().first_rotation_due(), "the hello brought the other key");
+        pull(low, high).unwrap();
+        let root = head(low).expect("the lowest peer started the chain");
+        assert!(!low.0.lock().unwrap().first_rotation_due());
+        pull(high, low).unwrap();
+        assert_eq!(head(high).as_deref(), Some(root.as_str()));
+        assert!(matches!(high.0.lock().unwrap().key_status(), KeyStatus::Current { .. }));
+        assert_eq!(records(&b), vec!["a-1"]);
+        // Never again: later passes keep the same head.
+        pull(low, high).unwrap();
+        pull(high, low).unwrap();
+        assert_eq!(head(low).as_deref(), Some(root.as_str()));
+        assert_eq!(head(high).as_deref(), Some(root.as_str()));
+    }
+
+    #[test]
+    fn an_upgrade_rotates_once_and_waits_for_every_device_key() {
+        let user = Keypair::generate_ed25519();
+        let g = linked(&user, &["a", "b", "c"]);
+        // C has not upgraded yet: drop its device key everywhere.
+        let c_peer = peer(&g[2]);
+        for s in &g {
+            let mut st = s.0.lock().unwrap();
+            st.roster.chain.devices.retain(|d| d.peer_id != c_peer);
+            st.auto_first_rotation = true;
+        }
+        for x in &g[..2] {
+            let st = x.0.lock().unwrap();
+            assert_eq!(st.devices_without_key().iter().map(|c| c.peer_id.clone()).collect::<Vec<_>>(), vec![c_peer.clone()]);
+            assert!(!st.first_rotation_due());
+        }
+        assert_eq!(g[0].0.lock().unwrap().rotate_if_first_due(1).unwrap(), None);
+        // C upgrades: its key spreads with its hellos, and the lowest peer rotates once.
+        g[2].0.lock().unwrap().publish_device_key(2).unwrap();
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    let _ = pull(&g[i], &g[j]);
+                }
+            }
+        }
+        for _ in 0..2 {
+            for i in 0..3 {
+                for j in 0..3 {
+                    if i != j {
+                        pull(&g[i], &g[j]).unwrap();
+                    }
+                }
+            }
+        }
+        let heads: Vec<_> = g.iter().map(head).collect();
+        assert!(heads[0].is_some() && heads.iter().all(|h| *h == heads[0]), "{heads:?}");
+        for s in &g {
+            let st = s.0.lock().unwrap();
+            assert_eq!(st.roster.chain.rotations.len(), 1, "exactly one first rotation");
+            assert!(matches!(st.key_status(), KeyStatus::Current { .. }));
+        }
     }
 }
