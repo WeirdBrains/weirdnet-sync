@@ -7,7 +7,6 @@ use crate::hlc::{Hlc, NodeId};
 use crate::log::OpLog;
 use crate::protocol::{Ack, Envelope, Hello, HelloOk, Message, PAGE_MAX, Pull, Refuse, RosterMsg, SYNC_PROFILE, decode, encode};
 use crate::roster::{Roster, SessionCheck};
-use crate::seal::typ;
 use std::sync::{Arc, Mutex};
 use weirdnet_net::user::NodeCert;
 use weirdnet_net::{Handler, Keypair, Multiaddr, Node, NodeConfig, PeerId, PublicKey, WEIRDNET};
@@ -37,10 +36,8 @@ impl SyncState {
         let reply = match msg {
             Message::Hello(h) => self.on_hello(from, h),
             Message::Pull(p) => self.on_pull(p),
-            Message::Ack(a) => {
-                self.log.set_cursor(&a.node_id, a.last_seq);
-                Message::Ack(Ack { node_id: a.node_id, last_seq: a.last_seq })
-            }
+            // An ack is the puller's progress, not ours: it must not move our cursors.
+            Message::Ack(a) => Message::Ack(Ack { node_id: a.node_id, last_seq: a.last_seq }),
             Message::Roster(r) => {
                 let incoming = Roster { epoch: r.epoch, certs: r.certs };
                 self.roster.merge(&incoming, &self.user_key, &WEIRDNET);
@@ -78,8 +75,9 @@ impl SyncState {
             return Message::Refuse(Refuse::new("type-off"));
         }
         let limit = (p.limit as usize).clamp(1, 4096);
-        let page = self.log.page(&p.node_id, p.after_seq, limit);
-        Message::Page(crate::protocol::page_for_type(&p.typ, page))
+        let known = self.log.cursor_for(&p.node_id, &p.typ);
+        let page = self.log.page_of_type(&p.node_id, &p.typ, p.after_seq, known, limit);
+        Message::Page(crate::protocol::Page { typ: p.typ, page })
     }
 
     /// A local write: tick the clock, append one log op.
@@ -164,33 +162,51 @@ pub fn pull_from(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: Pee
     }
     for (nid, _their) in to_pull {
         loop {
-            let after = state.log.cursor(&nid);
+            // Resume per type: a pull of another type over the same stream must not
+            // move this type's position.
+            let after = state.log.cursor_for(&nid, typ_name);
             let pull = Message::Pull(Pull { node_id: nid.clone(), after_seq: after, typ: typ_name.into(), limit: 512 });
             let env = Envelope::seal(&state.seed, &state.user_id, typ_name, state.roster.epoch, &from, &pull)?;
             let reply = request(node, peer, addrs, &env)?;
             match reply.open(&state.seed, &state.user_id, &from)? {
                 Message::Page(p) => {
-                    if p.page.ops.is_empty() {
+                    let last = p.page.to_seq;
+                    if p.typ != typ_name || p.page.node_id != nid || p.page.ops.iter().any(|e| e.typ != typ_name) {
+                        return Err(SyncError::Protocol("page of another type or node".into()));
+                    }
+                    if last <= after {
                         break;
                     }
-                    let n = state.log.integrate(&p.page);
-                    applied += n;
-                    let last = p.page.to_seq;
-                    state.log.set_cursor(&nid, last);
+                    applied += state.log.integrate(&p.page);
+                    state.log.set_cursor_for(&nid, typ_name, last);
+                    if last > state.log.cursor(&nid) {
+                        state.log.set_cursor(&nid, last);
+                    }
                     let ack = Message::Ack(Ack { node_id: nid.clone(), last_seq: last });
                     let env = Envelope::seal(&state.seed, &state.user_id, typ_name, state.roster.epoch, &from, &ack)?;
                     let _ = request(node, peer, addrs, &env)?;
-                    if n == 0 {
-                        break;
-                    }
                 }
                 Message::Refuse(r) => return Err(SyncError::Refused(r.reason)),
                 _ => return Err(SyncError::Protocol("expected Page".into())),
             }
         }
     }
-    let _ = typ::BOOKMARKS;
+    observe(state, now_ms());
     Ok(applied)
+}
+
+/// Advance our clock past the newest op held, so the next local write orders after
+/// everything this node has seen (a visit after a remote clear, say).
+pub fn observe(state: &mut SyncState, wall_ms: u64) {
+    if let Some(h) = state.log.newest_hlc().cloned()
+        && state.clock.as_ref().is_none_or(|c| h.cmp_total(c).is_gt())
+    {
+        state.clock = Some(Hlc::receive(state.clock.as_ref(), &h, wall_ms, state.our_node.clone()));
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 fn request(node: &Node<Vec<u8>, Vec<u8>>, peer: PeerId, addrs: &[Multiaddr], env: &Envelope) -> Result<Envelope> {
@@ -203,6 +219,7 @@ fn request(node: &Node<Vec<u8>, Vec<u8>>, peer: PeerId, addrs: &[Multiaddr], env
 mod tests {
     use super::*;
     use crate::roster::Roster;
+    use crate::seal::typ;
     use weirdnet_net::user;
 
     const SEED: [u8; 32] = *b"DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
@@ -249,6 +266,7 @@ mod tests {
             let mut a = sa.lock().unwrap();
             a.local_op(1_000, typ::BOOKMARKS, "bm-1", b"{\"title\":\"Rust\"}".to_vec());
             a.local_op(1_001, typ::HISTORY, "v-1", b"https://example".to_vec());
+            a.local_op(1_002, typ::BOOKMARKS, "bm-2", b"{}".to_vec());
         }
         let na = start_node(ka, node_config(true), sa.clone()).unwrap();
         let nb = start_node(kb, node_config(true), sb.clone()).unwrap();
@@ -268,6 +286,22 @@ mod tests {
         assert_eq!(entry.op, b"{\"title\":\"Rust\"}");
         let hist_visible = st_b.log.iter_node(&NodeId(na.peer_id().to_string())).any(|e| e.typ == typ::HISTORY);
         assert!(!hist_visible, "a bookmarks pull must not apply history ops");
+        assert!(st_b.clock.as_ref().is_some_and(|c| c.physical_ms >= 1_000), "the clock moved past what was pulled");
+
+        // The history op sits between two bookmarks on one stream: a later history pull
+        // must still find it (0.1.0 lost it because the bookmarks pull moved one cursor
+        // past it).
+        let a_node = NodeId(na.peer_id().to_string());
+        assert_eq!(st_b.log.get(&a_node, 3).expect("second bookmark").record_id, "bm-2");
+        st_b.types.push(typ::HISTORY.into());
+        sa.lock().unwrap().types.push(typ::HISTORY.into());
+        let applied = pull_from(&mut st_b, &nb, na.peer_id(), &addrs(&na), typ::HISTORY).unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(st_b.log.get(&a_node, 2).expect("history op").record_id, "v-1");
+        assert_eq!(pull_from(&mut st_b, &nb, na.peer_id(), &addrs(&na), typ::BOOKMARKS).unwrap(), 0);
+        assert_eq!(st_b.log.cursor_for(&a_node, typ::HISTORY), 3, "contiguous after both types");
+        assert_eq!(pull_from(&mut st_b, &nb, na.peer_id(), &addrs(&na), typ::HISTORY).unwrap(), 0);
+        assert_eq!(sa.lock().unwrap().log.cursor_for(&a_node, typ::BOOKMARKS), 3, "acks never move the server's cursors");
         drop(st_b);
 
         // A revoked B cannot pull after A revokes B and bumps the epoch.

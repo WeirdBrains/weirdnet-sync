@@ -18,6 +18,8 @@ The official WeirdBrains relay must not store sealed pages. Only a user-run node
 
 A session is accepted only if the peer presents a `NodeCert` for the same user that `WEIRDNET.verify_cert` accepts and that is not revoked.
 
+A node's log can mix record types. `Pull` asks for one type; pull positions are kept per (node, type) (`OpLog::cursor_for`), so pulling one type never skips another type's ops. `Page.to_seq` is the last seq the server walked, which may be past the last op it returned. A server answers only up to what it holds completely for that type: its own contiguous prefix of the node's log, or how far it has pulled that type itself. After a pull, `pull_from` moves the node's clock past the newest op it holds, so a later local write orders after everything it has seen. An `Ack` reports the puller's progress and never moves the server's own cursors.
+
 ## Merge rules
 
 - Field values are last-writer-wins by HLC.

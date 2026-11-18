@@ -6,6 +6,16 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Per-type pull cursors (`OpLog::cursor_for`, `set_cursor_for`, `type_cursors`), `OpLog::page_of_type`, `OpLog::contiguous`, `OpLog::newest_hlc` and `net::observe`.
+
+### Fixed
+
+- Pulling one record type no longer moves past another type's ops on the same node's log.
+- `pull_from` advances the local clock past the ops it pulled.
+- An `Ack` from a puller no longer overwrites the server's own cursor.
+
 ## [0.1.0] - 2026-11-17
 
 ### Added
