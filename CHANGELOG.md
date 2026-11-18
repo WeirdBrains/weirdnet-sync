@@ -15,6 +15,7 @@ All notable changes to weirdnet-sync are listed here. The format follows
 - Pulling one record type no longer moves past another type's ops on the same node's log.
 - `pull_from` advances the local clock past the ops it pulled.
 - An `Ack` from a puller no longer overwrites the server's own cursor.
+- A device that missed a revocation catches up: an older-epoch hello gets the roster and retries, and `pull_from` sends its roster to a server that is behind. Before, the other devices were refused with `epoch-behind` forever.
 
 ## [0.1.0] - 2026-11-17
 

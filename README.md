@@ -20,6 +20,8 @@ A session is accepted only if the peer presents a `NodeCert` for the same user t
 
 A node's log can mix record types. `Pull` asks for one type; pull positions are kept per (node, type) (`OpLog::cursor_for`), so pulling one type never skips another type's ops. `Page.to_seq` is the last seq the server walked, which may be past the last op it returned. A server answers only up to what it holds completely for that type: its own contiguous prefix of the node's log, or how far it has pulled that type itself. After a pull, `pull_from` moves the node's clock past the newest op it holds, so a later local write orders after everything it has seen. An `Ack` reports the puller's progress and never moves the server's own cursors.
 
+A revocation bumps the roster epoch. A hello from an unrevoked device of the same user at an older epoch gets the server's roster (user-signed certs and revocations) instead of a refusal; `pull_from` merges it and says hello again. When `pull_from` finds the server behind, it sends the server its roster. A revoked device is refused once a node holds the revocation. The epoch is mixed into `SyncKey`, but every device holds the identity seed, so a revoked device can still derive later keys: exclusion rests on the session check, not on the key. A real rekey needs a secret the revoked device never held (a new seed, or an epoch secret sealed to the remaining nodes).
+
 ## Merge rules
 
 - Field values are last-writer-wins by HLC.

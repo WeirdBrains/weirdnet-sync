@@ -62,6 +62,11 @@ impl SyncState {
             &crate::roster::SessionOffer { cert: &h.cert, epoch: h.epoch, types: &h.types },
             &self.types,
         );
+        if check == SessionCheck::EpochBehind {
+            // A valid, unrevoked device of this user that missed a revocation: send the
+            // roster (user-signed certs and revocations) so it can catch up and retry.
+            return Message::Roster(RosterMsg { certs: self.roster.certs.clone(), epoch: self.roster.epoch });
+        }
         if check != SessionCheck::Ok {
             return Message::Refuse(Refuse::new(check.reason().unwrap_or("wrong-user")));
         }
@@ -131,28 +136,45 @@ pub fn start_node(key: Keypair, cfg: NodeConfig, state: Arc<Mutex<SyncState>>) -
 /// Hello then pull every roster member the peer advertised, applying pages and acking.
 pub fn pull_from(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: PeerId, addrs: &[Multiaddr], typ_name: &str) -> Result<usize> {
     let from = node.peer_id().to_string();
-    let hello = Message::Hello(Hello {
-        cert: state.our_cert.clone(),
-        user_id: state.user_id.clone(),
-        epoch: state.roster.epoch,
-        types: state.types.clone(),
-        our_cursors: state.log.cursors().into_iter().collect(),
-        our_hlc: state.clock.clone().unwrap_or_else(|| Hlc::new(0, 0, state.our_node.clone())),
-    });
-    let env = Envelope::seal(&state.seed, &state.user_id, typ_name, state.roster.epoch, &from, &hello)?;
-    let reply = request(node, peer, addrs, &env)?;
-    let opened = reply.open(&state.seed, &state.user_id, &from)?;
-    let ok = match opened {
-        Message::HelloOk(ok) => ok,
-        Message::Refuse(r) => return Err(SyncError::Refused(r.reason)),
-        _ => return Err(SyncError::Protocol("expected HelloOk".into())),
+    let mut retried = false;
+    let ok = loop {
+        let hello = Message::Hello(Hello {
+            cert: state.our_cert.clone(),
+            user_id: state.user_id.clone(),
+            epoch: state.roster.epoch,
+            types: state.types.clone(),
+            our_cursors: state.log.cursors().into_iter().collect(),
+            our_hlc: state.clock.clone().unwrap_or_else(|| Hlc::new(0, 0, state.our_node.clone())),
+        });
+        let env = Envelope::seal(&state.seed, &state.user_id, typ_name, state.roster.epoch, &from, &hello)?;
+        let reply = request(node, peer, addrs, &env)?;
+        match reply.open(&state.seed, &state.user_id, &from)? {
+            Message::HelloOk(ok) => break ok,
+            // We are behind a revocation: take the peer's signed roster, then hello again.
+            Message::Roster(r) if !retried => {
+                let before = state.roster.epoch;
+                let key = state.user_key.clone();
+                state.roster.merge(&Roster { epoch: r.epoch, certs: r.certs }, &key, &WEIRDNET);
+                if state.roster.epoch == before {
+                    return Err(SyncError::Refused("epoch-behind".into()));
+                }
+                if !state.roster.get(&state.our_cert.peer_id).is_none_or(|c| c.active()) {
+                    return Err(SyncError::Refused("revoked".into()));
+                }
+                retried = true;
+            }
+            Message::Refuse(r) => return Err(SyncError::Refused(r.reason)),
+            _ => return Err(SyncError::Protocol("expected HelloOk".into())),
+        }
     };
-    if ok.epoch > state.roster.epoch {
-        state.roster.epoch = ok.epoch;
-    }
-    state.roster.upsert(ok.cert);
-    for c in ok.revocations {
-        state.roster.upsert(c);
+    let key = state.user_key.clone();
+    let behind = ok.epoch < state.roster.epoch;
+    state.roster.merge(&Roster { epoch: ok.epoch, certs: ok.revocations.into_iter().chain([ok.cert]).collect() }, &key, &WEIRDNET);
+    if behind {
+        // The peer missed a revocation we hold: hand it our roster so it can catch up.
+        let msg = Message::Roster(RosterMsg { certs: state.roster.certs.clone(), epoch: state.roster.epoch });
+        let env = Envelope::seal(&state.seed, &state.user_id, typ_name, state.roster.epoch, &from, &msg)?;
+        let _ = request(node, peer, addrs, &env)?;
     }
     let mut applied = 0;
     let mut to_pull: Vec<(NodeId, u64)> = ok.cursors;
@@ -315,6 +337,50 @@ mod tests {
         match err {
             SyncError::Refused(r) => assert!(r == "revoked" || r == "epoch-behind" || r == "wrong-user", "got {r}"),
             other => panic!("expected refuse, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_revocation_reaches_the_other_devices_both_ways() {
+        let user = Keypair::generate_ed25519();
+        let uid = user::user_id(&user.public());
+        let (ka, kb, kc, kd) = (Keypair::generate_ed25519(), Keypair::generate_ed25519(), Keypair::generate_ed25519(), Keypair::generate_ed25519());
+        let types = ["bookmarks"];
+        let (sa, _) = state(&user, &ka, &uid, "a", &types);
+        let (sb, _) = state(&user, &kb, &uid, "b", &types);
+        let (sc, _) = state(&user, &kc, &uid, "c", &types);
+        let (sd, _) = state(&user, &kd, &uid, "d", &types);
+        let all = [&sa, &sb, &sc, &sd];
+        let certs: Vec<_> = all.iter().map(|s| s.lock().unwrap().our_cert.clone()).collect();
+        for s in all {
+            for c in &certs {
+                s.lock().unwrap().roster.upsert(c.clone());
+            }
+        }
+        sa.lock().unwrap().local_op(1, typ::BOOKMARKS, "a-1", vec![1]);
+        let na = start_node(ka, node_config(true), sa.clone()).unwrap();
+        let nb = start_node(kb, node_config(true), sb.clone()).unwrap();
+        let nc = start_node(kc, node_config(true), sc.clone()).unwrap();
+        let nd = start_node(kd, node_config(true), sd.clone()).unwrap();
+        let c_peer = nc.peer_id().to_string();
+        sa.lock().unwrap().roster.revoke(&WEIRDNET, &user, &c_peer, 9).unwrap();
+
+        // B is a revocation behind A: A answers with its roster, B catches up and pulls.
+        let applied = pull_from(&mut sb.lock().unwrap(), &nb, na.peer_id(), &addrs(&na), typ::BOOKMARKS).unwrap();
+        assert_eq!(applied, 1);
+        {
+            let b = sb.lock().unwrap();
+            assert_eq!(b.roster.epoch, 1);
+            assert!(!b.roster.get(&c_peer).unwrap().active());
+        }
+        // A pulls from D (still behind): A pushes its roster to D.
+        pull_from(&mut sa.lock().unwrap(), &na, nd.peer_id(), &addrs(&nd), typ::BOOKMARKS).unwrap();
+        assert_eq!(sd.lock().unwrap().roster.epoch, 1);
+        assert!(!sd.lock().unwrap().roster.get(&c_peer).unwrap().active());
+        // C is refused everywhere that learned, and a roster reply never lets it back in.
+        for (n, label) in [(&nb, "b"), (&nd, "d"), (&na, "a")] {
+            let err = pull_from(&mut sc.lock().unwrap(), &nc, n.peer_id(), &addrs(n), typ::BOOKMARKS).unwrap_err();
+            assert!(matches!(err, SyncError::Refused(ref r) if r == "revoked"), "{label}: {err}");
         }
     }
 
