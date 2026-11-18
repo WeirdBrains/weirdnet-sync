@@ -16,7 +16,10 @@
 //!   plus one. A root (no parent) is valid when its creator has an active cert. A
 //!   revoked creator's rotations stop counting, with everything built on them.
 //! - Once a device holds a key from a root it keeps that root ([`KeyChain::root`]); a
-//!   later root from someone holding only the seed is ignored.
+//!   later root from someone holding only the seed is ignored. Two devices can each
+//!   start a root before they know of each other; a root whose creator is a member of
+//!   the chain a device follows is trusted, and the earliest trusted root wins. A
+//!   device in both chains admits the devices it approved into both, so they merge.
 //! - The members of a rotation are its recipients plus devices admitted to it by a
 //!   member. The head is the valid rotation with the highest epoch, then one with no
 //!   revoked member, then the lowest id. A head with a revoked member needs another
@@ -299,6 +302,9 @@ pub struct ValidRotation {
     pub clean: bool,
 }
 
+/// A chain entry with its id.
+type Ided<'a, T> = (String, &'a T);
+
 /// The chain as this roster sees it: valid rotations from the root, and the head.
 #[derive(Debug, Clone, Default)]
 pub struct ChainView {
@@ -328,23 +334,65 @@ impl Roster {
         self.active().map(|c| c.peer_id.as_str()).collect()
     }
 
+    fn signed_parts(&self) -> (Vec<Ided<'_, Rotation>>, Vec<Ided<'_, Admission>>) {
+        let active = self.active_set();
+        let rots = self.chain.rotations.iter().filter(|r| active.contains(r.by.as_str()) && r.signed()).map(|r| (r.id(), r)).collect();
+        let adms = self.chain.admissions.iter().filter(|a| active.contains(a.by.as_str()) && a.signed()).map(|a| (a.id(), a)).collect();
+        (rots, adms)
+    }
+
+    /// The view from every root, the followed one or not. A device that is in two
+    /// chains (two first roots made at once) uses these to bring the devices it
+    /// approved into both, so the chains can merge.
+    pub fn all_views(&self) -> Vec<ChainView> {
+        let revoked = self.revoked_set();
+        let (rots, adms) = self.signed_parts();
+        rots.iter()
+            .filter(|(_, r)| r.parent.is_none() && r.recipients().any(|p| p == r.by))
+            .map(|root| self.view_from(root, &rots, &adms, &revoked))
+            .collect()
+    }
+
     /// Work out which rotations count, their members, and the head.
     pub fn chain_view(&self) -> ChainView {
         let revoked = self.revoked_set();
-        let active = self.active_set();
-        let rots: Vec<(String, &Rotation)> =
-            self.chain.rotations.iter().filter(|r| active.contains(r.by.as_str()) && r.signed()).map(|r| (r.id(), r)).collect();
-        let adms: Vec<(String, &Admission)> =
-            self.chain.admissions.iter().filter(|a| active.contains(a.by.as_str()) && a.signed()).map(|a| (a.id(), a)).collect();
+        let (rots, adms) = self.signed_parts();
 
         let roots: Vec<&(String, &Rotation)> = rots.iter().filter(|(_, r)| r.parent.is_none() && r.recipients().any(|p| p == r.by)).collect();
-        let root = match &self.chain.root {
-            Some(id) => roots.iter().find(|(rid, _)| rid == id),
-            None => roots.iter().min_by(|a, b| (a.1.epoch, &a.0).cmp(&(b.1.epoch, &b.0))),
+        fn order(r: &(String, &Rotation)) -> (u32, String) {
+            (r.1.epoch, r.0.clone())
+        }
+        let mut root = match &self.chain.root {
+            Some(id) => roots.iter().find(|(rid, _)| rid == id).copied(),
+            None => roots.iter().copied().min_by_key(|r| order(r)),
         };
-        let mut view = ChainView::default();
-        let Some((root_id, root_rot)) = root else { return view };
-        view.root = Some(root_id.clone());
+        // Two devices can start a root at once (both saw themselves as the first). A
+        // root whose creator is a member of the chain we follow is trusted; the earliest
+        // trusted root wins, so every device ends up on the same one. A root from a
+        // device nobody in our chain admitted stays ignored.
+        let mut seen = BTreeSet::new();
+        while let Some(cur) = root {
+            if !seen.insert(cur.0.clone()) {
+                break;
+            }
+            let view = self.view_from(cur, &rots, &adms, &revoked);
+            let trusted = |r: &&&(String, &Rotation)| view.valid.values().any(|v| v.members.contains(&r.1.by));
+            match roots.iter().filter(trusted).min_by_key(|r| order(r)) {
+                Some(best) if order(best) < order(cur) => root = Some(best),
+                _ => return view,
+            }
+        }
+        root.map(|r| self.view_from(r, &rots, &adms, &revoked)).unwrap_or_default()
+    }
+
+    fn view_from(
+        &self,
+        (root_id, root_rot): &(String, &Rotation),
+        rots: &[(String, &Rotation)],
+        adms: &[(String, &Admission)],
+        revoked: &BTreeSet<&str>,
+    ) -> ChainView {
+        let mut view = ChainView { root: Some(root_id.clone()), ..ChainView::default() };
 
         let members_of = |id: &str, r: &Rotation, admitted: &mut Vec<String>| -> BTreeSet<String> {
             let mut m: BTreeSet<String> = r.recipients().map(str::to_string).collect();
@@ -371,7 +419,7 @@ impl Roster {
         add(&mut view, root_id, root_rot, &mut admitted);
         loop {
             let mut grew = false;
-            for (id, r) in &rots {
+            for (id, r) in rots {
                 if view.valid.contains_key(id) {
                     continue;
                 }
@@ -581,11 +629,13 @@ impl SyncState {
         let me = device.peer_id();
         let Some(my_pub) = self.roster.chain.device(&me).and_then(DeviceKey::public) else { return 0 };
         let view = self.roster.chain_view();
+        let views = self.roster.all_views();
+        let valid = |id: &str| views.iter().any(|v| v.valid.contains_key(id));
         let mut n = 0;
         let checks: BTreeMap<String, String> = self.roster.chain.rotations.iter().map(|r| (r.id(), r.check.clone())).collect();
         for r in &self.roster.chain.rotations {
             let id = r.id();
-            if !view.valid.contains_key(&id) || self.keys.has(&id) {
+            if !valid(&id) || self.keys.has(&id) {
                 continue;
             }
             let Some(sk) = r.keys.iter().find(|k| k.peer_id == me) else { continue };
@@ -598,14 +648,11 @@ impl SyncState {
             }
         }
         for a in &self.roster.chain.admissions {
-            if a.peer_id != me || !view.admissions.contains(&a.id()) {
+            if a.peer_id != me || !views.iter().any(|v| v.admissions.contains(&a.id())) {
                 continue;
             }
             if let Ok(plain) = open_from(&device.exchange, &a.eph, &a.transcript(&my_pub), &a.sealed) {
-                n += self
-                    .keys
-                    .absorb(&plain, |id, key| view.valid.contains_key(id) && checks.get(id).is_some_and(|c| *c == key_check(key)))
-                    .unwrap_or(0);
+                n += self.keys.absorb(&plain, |id, key| valid(id) && checks.get(id).is_some_and(|c| *c == key_check(key))).unwrap_or(0);
             }
         }
         if self.roster.chain.root.is_none()
@@ -698,28 +745,41 @@ impl SyncState {
     }
 
     /// Admit every approved device whose device key is known and that is not yet a
-    /// member of the head. Members and revoked devices leave the list. Returns the
-    /// devices admitted.
+    /// member of the head, in every chain whose head key this device holds (normally
+    /// one; two when two first roots were made at once). Members of all of them and
+    /// revoked devices leave the list. Returns the devices admitted.
     pub fn admit_approved(&mut self, at_ms: i64) -> Vec<String> {
         let mut admitted = Vec::new();
         if self.roster.chain.approved.is_empty() || self.device.is_none() {
             return admitted;
         }
         for peer in self.roster.chain.approved.clone() {
-            let view = self.roster.chain_view();
-            let Some(head) = view.head() else { break };
-            if !self.keys.has(&head.id) {
-                break;
+            let active = self.roster.get(&peer).is_some_and(|c| c.active());
+            let mut done = active;
+            let mut any = false;
+            for view in self.roster.all_views() {
+                let Some(head) = view.head() else { continue };
+                if !self.keys.has(&head.id) {
+                    if view.root == self.roster.chain_view().root {
+                        done = false;
+                    }
+                    continue;
+                }
+                any = true;
+                if !active || head.members.contains(&peer) {
+                    continue;
+                }
+                let admitted_now = self.roster.chain.device(&peer).is_some()
+                    && self.roster.get(&peer).cloned().is_some_and(|cert| self.admit_to(cert, &view, at_ms).unwrap_or(false));
+                if admitted_now {
+                    if !admitted.contains(&peer) {
+                        admitted.push(peer.clone());
+                    }
+                } else {
+                    done = false;
+                }
             }
-            let done = head.members.contains(&peer) || self.roster.get(&peer).is_none_or(|c| !c.active());
-            if !done
-                && self.roster.chain.device(&peer).is_some()
-                && let Some(cert) = self.roster.get(&peer).cloned()
-                && self.admit(cert, at_ms).unwrap_or(false)
-            {
-                admitted.push(peer.clone());
-            }
-            if done || admitted.contains(&peer) {
+            if !active || (any && done) {
                 self.roster.chain.approved.retain(|p| p != &peer);
             }
         }
@@ -737,10 +797,14 @@ impl SyncState {
         if self.roster.get(&cert.peer_id).is_some_and(|c| !c.active()) {
             return Err(SyncError::Refused("revoked".into()));
         }
+        self.roster.upsert(cert.clone());
+        let view = self.roster.chain_view();
+        self.admit_to(cert, &view, at_ms)
+    }
+
+    fn admit_to(&mut self, cert: NodeCert, view: &ChainView, at_ms: i64) -> Result<bool> {
         let device = self.device.clone().ok_or_else(|| SyncError::Protocol("no device key".into()))?;
         let peer = cert.peer_id.clone();
-        self.roster.upsert(cert);
-        let view = self.roster.chain_view();
         let Some(head) = view.head() else { return Ok(false) };
         if !self.keys.has(&head.id) {
             return Err(SyncError::Refused("needs-admission".into()));

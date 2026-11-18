@@ -778,6 +778,43 @@ mod tests {
     }
 
     #[test]
+    fn two_first_roots_made_at_once_settle_on_one() {
+        // A links B, then C, before anyone syncs. B knows only A and itself, sees itself
+        // as the lowest and starts a root; C knows all three and starts another.
+        let user = Keypair::generate_ed25519();
+        let mut g = linked(&user, &["a", "b", "c"]);
+        g.sort_by_key(peer);
+        let (lo, mid, hi) = (&g[0], &g[1], &g[2]);
+        let lo_cert = lo.0.lock().unwrap().our_cert.clone();
+        let lo_key = lo.0.lock().unwrap().roster.chain.device(&peer(lo)).cloned().unwrap();
+        {
+            let mut st = mid.0.lock().unwrap();
+            st.roster.certs.retain(|c| c.peer_id != peer(lo));
+            st.roster.chain.devices.retain(|d| d.peer_id != peer(lo));
+            st.rotate(1).unwrap();
+            st.roster.upsert(lo_cert.clone());
+            st.roster.chain.devices.push(lo_key);
+        }
+        lo.0.lock().unwrap().rotate(1).unwrap();
+        // The device that linked the late one approved it.
+        hi.0.lock().unwrap().approve(lo_cert, 2).unwrap();
+        for _ in 0..3 {
+            for i in 0..3 {
+                for j in 0..3 {
+                    if i != j {
+                        let _ = pull(&g[i], &g[j]);
+                    }
+                }
+            }
+        }
+        let heads: Vec<_> = g.iter().map(head).collect();
+        assert!(heads[0].is_some() && heads.iter().all(|h| *h == heads[0]), "{heads:?}");
+        for s in &g {
+            assert!(matches!(s.0.lock().unwrap().key_status(), KeyStatus::Current { .. }));
+        }
+    }
+
+    #[test]
     fn a_late_root_and_a_revoked_creator_do_not_move_the_head() {
         let user = Keypair::generate_ed25519();
         let g = linked(&user, &["a", "b", "c"]);
