@@ -99,6 +99,15 @@ impl SyncState {
         self.refresh_keys();
     }
 
+    /// Take the epoch keys (and adopted root) another copy of this state picked up,
+    /// for apps that pull into a snapshot and fold it back. Merge the roster as well.
+    pub fn take_keys_from(&mut self, other: &SyncState) {
+        self.keys.merge(&other.keys);
+        if self.roster.chain.root.is_none() {
+            self.roster.chain.root = other.roster.chain.root.clone();
+        }
+    }
+
     fn is_revoked(&self, peer: &str) -> bool {
         self.roster.get(peer).is_some_and(|c| !c.active())
     }
@@ -771,6 +780,8 @@ mod tests {
         // C, unaware, rotates off the root it still holds. Its rotation stops counting
         // once its revocation is known, so it never becomes the head.
         c.0.lock().unwrap().rotate(3).unwrap();
+        c.0.lock().unwrap().rotate(4).unwrap();
+        assert!(c.0.lock().unwrap().roster.chain_view().head().unwrap().epoch > a.0.lock().unwrap().roster.chain_view().head().unwrap().epoch);
         // A seed holder with a fresh node starts its own root that includes everyone.
         let uid = user::user_id(&user.public());
         let mk = Keypair::generate_ed25519();
@@ -784,6 +795,7 @@ mod tests {
             let key = m.user_key.clone();
             m.roster.merge(&plain, &key, &WEIRDNET);
             m.rotate(1).unwrap();
+            assert!(m.roster.chain_view().head().unwrap().epoch > 2, "it outnumbers the real head");
         }
         let minted_cert = ms.lock().unwrap().our_cert.clone();
         let minted_chain = ms.lock().unwrap().roster.chain.clone();

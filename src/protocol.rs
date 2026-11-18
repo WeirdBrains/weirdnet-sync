@@ -252,4 +252,34 @@ mod tests {
         assert!(env.open(&SEED, &uid, "peer-c").is_err());
         assert!(Envelope { typ: "history".into(), ..env.clone() }.open(&SEED, &uid, "peer-b").is_err());
     }
+
+    #[test]
+    fn seed_envelopes_and_rosters_keep_the_0_2_wire_shape() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct EnvelopeV02 {
+            typ: String,
+            epoch: u32,
+            sealed: Sealed,
+        }
+        let (msg, uid, _) = hello();
+        let env = Envelope::seal(&SEED, &uid, "bookmarks", 0, "peer-b", &msg).unwrap();
+        let old: EnvelopeV02 = decode(&encode(&env).unwrap()).unwrap();
+        assert_eq!(encode(&old).unwrap(), encode(&env).unwrap(), "no key field on a seed envelope");
+        let back: Envelope = decode(&encode(&old).unwrap()).unwrap();
+        assert_eq!(back.key, None);
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "kebab-case")]
+        enum OldMessage {
+            Roster { certs: Vec<NodeCert>, epoch: u32 },
+        }
+        let old = encode(&OldMessage::Roster { certs: vec![], epoch: 3 }).unwrap();
+        assert_eq!(decode::<Message>(&old).unwrap(), Message::Roster(RosterMsg { certs: vec![], epoch: 3, chain: KeyChain::default() }));
+        // A keyed envelope never opens as a seed one.
+        let k = Key32::random().unwrap();
+        let keyed = Envelope::seal_keyed(&k, "r1", &uid, "bookmarks", 1, "peer-b", &msg).unwrap();
+        assert!(keyed.open(&SEED, &uid, "peer-b").is_err());
+        assert_eq!(keyed.open_keyed(&k, &uid, "peer-b").unwrap(), msg);
+        assert!(keyed.open_keyed(&k, &uid, "peer-c").is_err());
+        assert!(Envelope { key: Some("r2".into()), ..keyed.clone() }.open_keyed(&k, &uid, "peer-b").is_err());
+    }
 }
