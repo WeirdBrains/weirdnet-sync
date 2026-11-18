@@ -6,6 +6,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-18
+
 ### Added
 
 - Per-type pull cursors (`OpLog::cursor_for`, `set_cursor_for`, `type_cursors`), `OpLog::page_of_type`, `OpLog::contiguous`, `OpLog::newest_hlc` and `net::observe`.
@@ -23,5 +25,6 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 - HLC, op log, LWW registers, OR-sets, tombstone GC, SyncKey page sealing, roster / self-cert / revocation, and the `weirdnet-sync/v1` protocol over `weirdnet-net` 0.6.0.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/WeirdBrains/weirdnet-sync/releases/tag/v0.1.0
