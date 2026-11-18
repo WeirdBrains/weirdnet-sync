@@ -1,7 +1,9 @@
 //! `SyncKey` derivation and page sealing.
 //!
 //! `SyncKey(type) = HKDF-SHA256(seed, salt = user id, info = weirdnet-sync/v1/<type>)`,
-//! or `weirdnet-sync/v1/<type>/e<n>` after a revocation bumps the epoch.
+//! or `weirdnet-sync/v1/<type>/e<n>` after a revocation bumps the epoch. After a
+//! rotation ([`crate::rotation`]) the key comes from the random epoch key instead:
+//! `HKDF-SHA256(epoch key, salt = user id, info = weirdnet-sync/v1/<type>/e<n>/k<id>)`.
 use crate::error::Result;
 use weirdnet_keys::{Key32, Sealed, kdf, open, seal};
 
@@ -32,6 +34,17 @@ pub fn sync_key(seed: &[u8], user_id: &str, typ: &str, epoch: u32) -> Result<Syn
 /// be replayed under another type, epoch or peer.
 pub fn page_aad(typ: &str, epoch: u32, peer: &str) -> Vec<u8> {
     format!("weirdnet-sync/v1|{typ}|e{epoch}|{peer}").into_bytes()
+}
+
+/// `SyncKey(type)` under a rotated epoch key (rotation `id`).
+pub fn rotated_sync_key(epoch_key: &Key32, user_id: &str, typ: &str, epoch: u32, id: &str) -> Result<SyncKey> {
+    let info = format!("weirdnet-sync/v1/{typ}/e{epoch}/k{id}");
+    Ok(kdf::hkdf(&epoch_key.0, Some(user_id.as_bytes()), info.as_bytes())?)
+}
+
+/// Associated data of a page sealed under a rotated key: also binds the rotation id.
+pub fn page_aad_keyed(typ: &str, epoch: u32, id: &str, peer: &str) -> Vec<u8> {
+    format!("weirdnet-sync/v1|{typ}|e{epoch}|k{id}|{peer}").into_bytes()
 }
 
 pub fn seal_page(key: &SyncKey, typ: &str, epoch: u32, peer: &str, plaintext: &[u8]) -> Result<Sealed> {

@@ -5,8 +5,9 @@
 use crate::error::{Result, SyncError};
 use crate::hlc::{Hlc, NodeId};
 use crate::log::OpLog;
-use crate::protocol::{Ack, Envelope, Hello, HelloOk, Message, PAGE_MAX, Pull, Refuse, RosterMsg, SYNC_PROFILE, decode, encode};
+use crate::protocol::{Ack, Envelope, Hello, HelloOk, KeyRef, Message, PAGE_MAX, Pull, Refuse, RosterMsg, SYNC_PROFILE, decode, encode};
 use crate::roster::{Roster, SessionCheck};
+use crate::rotation::{Device, EpochKeys, KeyChain};
 use std::sync::{Arc, Mutex};
 use weirdnet_net::user::NodeCert;
 use weirdnet_net::{Handler, Keypair, Multiaddr, Node, NodeConfig, PeerId, PublicKey, WEIRDNET};
@@ -22,57 +23,154 @@ pub struct SyncState {
     pub roster: Roster,
     pub log: OpLog,
     pub clock: Option<Hlc>,
+    /// This device's node and exchange secrets. Without them the state stays on
+    /// seed-derived keys and cannot rotate or open a rotated key.
+    pub device: Option<Device>,
+    /// Rotated epoch keys this device holds (secret; persist encrypted).
+    pub keys: EpochKeys,
 }
 
 impl SyncState {
-    pub fn handle(&mut self, from: &str, env: Envelope) -> Result<Envelope> {
-        // Open with our seed and user id; a foreign user fails here (wrong-user).
-        let msg = match env.open(&self.seed, &self.user_id, from) {
-            Ok(m) => m,
-            Err(_) => {
-                return self.refuse(from, &env.typ, env.epoch, "wrong-user");
-            }
+    /// A state for this device. With `node_key`, it publishes its device key so
+    /// rotations can include it.
+    pub fn new(seed: Vec<u8>, user_key: PublicKey, our_cert: NodeCert, node_key: Option<&Keypair>, types: Vec<String>) -> Result<Self> {
+        let device = node_key.map(Device::from_node_key).transpose()?;
+        let mut roster = Roster::new();
+        roster.upsert(our_cert.clone());
+        let mut st = Self {
+            seed,
+            user_id: our_cert.user_id.clone(),
+            user_key,
+            our_node: NodeId::new(our_cert.peer_id.clone()),
+            our_cert,
+            types,
+            roster,
+            log: OpLog::new(),
+            clock: None,
+            device,
+            keys: EpochKeys::new(),
         };
+        if st.device.is_some() {
+            st.publish_device_key(st.our_cert.issued_at)?;
+        }
+        Ok(st)
+    }
+
+    /// The key new envelopes are sealed with: the head epoch key when we hold it,
+    /// otherwise the seed-derived key (enough to catch up and be re-admitted).
+    pub fn current_key(&self) -> KeyRef {
+        match self.roster.head_id() {
+            Some(id) if self.keys.has(&id) => {
+                let epoch = self.roster.chain_view().head().map(|h| h.epoch).unwrap_or(self.roster.epoch);
+                KeyRef { epoch, id: Some(id) }
+            }
+            _ => KeyRef::seed(self.roster.epoch),
+        }
+    }
+
+    pub fn seal_envelope(&self, key: &KeyRef, typ: &str, peer: &str, msg: &Message) -> Result<Envelope> {
+        match &key.id {
+            None => Envelope::seal(&self.seed, &self.user_id, typ, key.epoch, peer, msg),
+            Some(id) => {
+                let k = self.keys.get(id).ok_or_else(|| SyncError::Crypto("unknown epoch key".into()))?;
+                Envelope::seal_keyed(k, id, &self.user_id, typ, key.epoch, peer, msg)
+            }
+        }
+    }
+
+    pub fn open_envelope(&self, env: &Envelope, peer: &str) -> Result<Message> {
+        match &env.key {
+            None => env.open(&self.seed, &self.user_id, peer),
+            Some(id) => {
+                let k = self.keys.get(id).ok_or_else(|| SyncError::Crypto("unknown epoch key".into()))?;
+                env.open_keyed(k, &self.user_id, peer)
+            }
+        }
+    }
+
+    fn roster_msg(&self) -> Message {
+        Message::Roster(RosterMsg { certs: self.roster.certs.clone(), epoch: self.roster.epoch, chain: self.roster.chain.shared() })
+    }
+
+    /// Merge certs, epoch and chain from a peer, then open any key sealed to us.
+    fn absorb(&mut self, certs: Vec<NodeCert>, epoch: u32, chain: KeyChain) {
+        let key = self.user_key.clone();
+        self.roster.merge(&Roster { epoch, certs, chain }, &key, &WEIRDNET);
+        self.refresh_keys();
+    }
+
+    fn is_revoked(&self, peer: &str) -> bool {
+        self.roster.get(peer).is_some_and(|c| !c.active())
+    }
+
+    pub fn handle(&mut self, from: &str, env: Envelope) -> Result<Envelope> {
+        let key = KeyRef { epoch: env.epoch, id: env.key.clone() };
+        // Open with our keys and user id; a foreign user fails here (wrong-user).
+        let msg = match self.open_envelope(&env, from) {
+            Ok(m) => m,
+            // Sealed under a rotation we don't hold: we are behind. Say so under the seed
+            // key, so the asker sends us its roster.
+            Err(_) if env.key.is_some() => return self.refuse(from, &env.typ, env.epoch, "unknown-key"),
+            Err(_) => return self.refuse(from, &env.typ, env.epoch, "wrong-user"),
+        };
+        let head = self.roster.head_id();
+        // After a rotation only the head key carries data; older and seed-derived keys
+        // (which a revoked device may hold) only get the roster.
+        let at_head = head.is_none() || env.key == head;
         let reply = match msg {
-            Message::Hello(h) => self.on_hello(from, h),
+            Message::Hello(h) => self.on_hello(from, h, at_head),
+            Message::Pull(_) if !at_head => Message::Refuse(Refuse::new("epoch-behind")),
+            Message::Pull(_) if self.is_revoked(from) => Message::Refuse(Refuse::new("revoked")),
             Message::Pull(p) => self.on_pull(p),
             // An ack is the puller's progress, not ours: it must not move our cursors.
             Message::Ack(a) => Message::Ack(Ack { node_id: a.node_id, last_seq: a.last_seq }),
             Message::Roster(r) => {
-                let incoming = Roster { epoch: r.epoch, certs: r.certs };
-                self.roster.merge(&incoming, &self.user_key, &WEIRDNET);
-                Message::Roster(RosterMsg { certs: self.roster.certs.clone(), epoch: self.roster.epoch })
+                self.absorb(r.certs, r.epoch, r.chain);
+                self.roster_msg()
             }
             Message::HelloOk(_) | Message::Page(_) | Message::Refuse(_) => {
                 return Err(SyncError::Protocol("unexpected request".into()));
             }
         };
-        Envelope::seal(&self.seed, &self.user_id, &env.typ, self.roster.epoch, from, &reply)
+        // Answer under the key the request came in, so a peer behind us can read it.
+        self.seal_envelope(&key, &env.typ, from, &reply)
     }
 
     fn refuse(&self, from: &str, typ: &str, epoch: u32, reason: &'static str) -> Result<Envelope> {
         Envelope::seal(&self.seed, &self.user_id, typ, epoch, from, &Message::Refuse(Refuse::new(reason)))
     }
 
-    fn on_hello(&self, _from: &str, h: Hello) -> Message {
+    fn on_hello(&mut self, _from: &str, h: Hello, at_head: bool) -> Message {
+        let rotated = self.roster.head_id().is_some();
+        // After a rotation the key decides who is current, not the epoch number.
+        let epoch = if rotated { self.roster.epoch } else { h.epoch };
         let check = self.roster.check_session(
             &WEIRDNET,
             &self.user_key,
             &self.user_id,
-            &crate::roster::SessionOffer { cert: &h.cert, epoch: h.epoch, types: &h.types },
+            &crate::roster::SessionOffer { cert: &h.cert, epoch, types: &h.types },
             &self.types,
         );
-        if check == SessionCheck::EpochBehind {
-            // A valid, unrevoked device of this user that missed a revocation: send the
-            // roster (user-signed certs and revocations) so it can catch up and retry.
-            return Message::Roster(RosterMsg { certs: self.roster.certs.clone(), epoch: self.roster.epoch });
+        if matches!(check, SessionCheck::WrongUser | SessionCheck::Revoked) {
+            return Message::Refuse(Refuse::new(check.reason().unwrap_or("wrong-user")));
+        }
+        // Learn the peer's device key and rotations (signed; checked on merge).
+        if !h.chain.is_empty() {
+            self.roster.chain.merge(&h.chain);
+            self.refresh_keys();
+        }
+        if (rotated && !at_head) || check == SessionCheck::EpochBehind {
+            // A valid, unrevoked device of this user that missed a revocation or a
+            // rotation, or one waiting to be re-admitted: send the roster (user-signed
+            // certs and revocations, and the key chain) so it can catch up and retry.
+            return self.roster_msg();
         }
         if check != SessionCheck::Ok {
             return Message::Refuse(Refuse::new(check.reason().unwrap_or("wrong-user")));
         }
         let cursors = self.log.cursors().into_iter().collect();
         let revocations = self.roster.certs.iter().filter(|c| !c.active()).cloned().collect();
-        Message::HelloOk(HelloOk { cert: self.our_cert.clone(), epoch: self.roster.epoch, cursors, revocations })
+        Message::HelloOk(HelloOk { cert: self.our_cert.clone(), epoch: self.roster.epoch, cursors, revocations, chain: self.roster.chain.shared() })
     }
 
     fn on_pull(&self, p: Pull) -> Message {
@@ -134,46 +232,62 @@ pub fn start_node(key: Keypair, cfg: NodeConfig, state: Arc<Mutex<SyncState>>) -
 }
 
 /// Hello then pull every roster member the peer advertised, applying pages and acking.
+///
+/// Catches up on revocations and rotations both ways, and replaces a head rotation
+/// that still includes a revoked device. Fails with `Refused("needs-admission")` when
+/// the chain has moved on without this device (restored from the seed): another device
+/// has to [`SyncState::admit`] it.
 pub fn pull_from(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: PeerId, addrs: &[Multiaddr], typ_name: &str) -> Result<usize> {
     let from = node.peer_id().to_string();
-    let mut retried = false;
+    let mut catch_ups = 0;
+    let mut pushed = false;
     let ok = loop {
+        let key = state.current_key();
         let hello = Message::Hello(Hello {
             cert: state.our_cert.clone(),
             user_id: state.user_id.clone(),
-            epoch: state.roster.epoch,
+            epoch: key.epoch,
             types: state.types.clone(),
             our_cursors: state.log.cursors().into_iter().collect(),
             our_hlc: state.clock.clone().unwrap_or_else(|| Hlc::new(0, 0, state.our_node.clone())),
+            chain: state.roster.chain.shared(),
         });
-        let env = Envelope::seal(&state.seed, &state.user_id, typ_name, state.roster.epoch, &from, &hello)?;
+        let env = state.seal_envelope(&key, typ_name, &from, &hello)?;
         let reply = request(node, peer, addrs, &env)?;
-        match reply.open(&state.seed, &state.user_id, &from)? {
+        match state.open_envelope(&reply, &from)? {
             Message::HelloOk(ok) => break ok,
-            // We are behind a revocation: take the peer's signed roster, then hello again.
-            Message::Roster(r) if !retried => {
-                let before = state.roster.epoch;
-                let key = state.user_key.clone();
-                state.roster.merge(&Roster { epoch: r.epoch, certs: r.certs }, &key, &WEIRDNET);
-                if state.roster.epoch == before {
-                    return Err(SyncError::Refused("epoch-behind".into()));
-                }
+            // We are behind a revocation or rotation: take the peer's signed roster and
+            // chain, then hello again.
+            Message::Roster(r) if catch_ups < 3 => {
+                state.absorb(r.certs, r.epoch, r.chain);
                 if !state.roster.get(&state.our_cert.peer_id).is_none_or(|c| c.active()) {
                     return Err(SyncError::Refused("revoked".into()));
                 }
-                retried = true;
+                if state.current_key() == key {
+                    let reason = if state.needs_admission() { "needs-admission" } else { "epoch-behind" };
+                    return Err(SyncError::Refused(reason.into()));
+                }
+                catch_ups += 1;
+            }
+            // The peer missed a rotation we hold: hand it our roster under the seed key
+            // (the chain is public; the epoch keys inside are sealed), then hello again.
+            Message::Refuse(r) if r.reason == "unknown-key" && !pushed => {
+                let env = state.seal_envelope(&KeyRef::seed(state.roster.epoch), typ_name, &from, &state.roster_msg())?;
+                if let Ok(Message::Roster(back)) = request(node, peer, addrs, &env).and_then(|e| state.open_envelope(&e, &from)) {
+                    state.absorb(back.certs, back.epoch, back.chain);
+                }
+                pushed = true;
             }
             Message::Refuse(r) => return Err(SyncError::Refused(r.reason)),
             _ => return Err(SyncError::Protocol("expected HelloOk".into())),
         }
     };
-    let key = state.user_key.clone();
     let behind = ok.epoch < state.roster.epoch;
-    state.roster.merge(&Roster { epoch: ok.epoch, certs: ok.revocations.into_iter().chain([ok.cert]).collect() }, &key, &WEIRDNET);
+    state.absorb(ok.revocations.into_iter().chain([ok.cert]).collect(), ok.epoch, ok.chain);
+    let key = state.current_key();
     if behind {
         // The peer missed a revocation we hold: hand it our roster so it can catch up.
-        let msg = Message::Roster(RosterMsg { certs: state.roster.certs.clone(), epoch: state.roster.epoch });
-        let env = Envelope::seal(&state.seed, &state.user_id, typ_name, state.roster.epoch, &from, &msg)?;
+        let env = state.seal_envelope(&key, typ_name, &from, &state.roster_msg())?;
         let _ = request(node, peer, addrs, &env)?;
     }
     let mut applied = 0;
@@ -188,9 +302,9 @@ pub fn pull_from(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: Pee
             // move this type's position.
             let after = state.log.cursor_for(&nid, typ_name);
             let pull = Message::Pull(Pull { node_id: nid.clone(), after_seq: after, typ: typ_name.into(), limit: 512 });
-            let env = Envelope::seal(&state.seed, &state.user_id, typ_name, state.roster.epoch, &from, &pull)?;
+            let env = state.seal_envelope(&key, typ_name, &from, &pull)?;
             let reply = request(node, peer, addrs, &env)?;
-            match reply.open(&state.seed, &state.user_id, &from)? {
+            match state.open_envelope(&reply, &from)? {
                 Message::Page(p) => {
                     let last = p.page.to_seq;
                     if p.typ != typ_name || p.page.node_id != nid || p.page.ops.iter().any(|e| e.typ != typ_name) {
@@ -205,7 +319,7 @@ pub fn pull_from(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: Pee
                         state.log.set_cursor(&nid, last);
                     }
                     let ack = Message::Ack(Ack { node_id: nid.clone(), last_seq: last });
-                    let env = Envelope::seal(&state.seed, &state.user_id, typ_name, state.roster.epoch, &from, &ack)?;
+                    let env = state.seal_envelope(&key, typ_name, &from, &ack)?;
                     let _ = request(node, peer, addrs, &env)?;
                 }
                 Message::Refuse(r) => return Err(SyncError::Refused(r.reason)),
@@ -214,6 +328,11 @@ pub fn pull_from(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: Pee
         }
     }
     observe(state, now_ms());
+    if state.needs_rotation() {
+        // The head still includes a device that has since been revoked (say, revoked
+        // on a device without a node key): replace it.
+        state.rotate(now_ms() as i64)?;
+    }
     Ok(applied)
 }
 
@@ -241,6 +360,7 @@ fn request(node: &Node<Vec<u8>, Vec<u8>>, peer: PeerId, addrs: &[Multiaddr], env
 mod tests {
     use super::*;
     use crate::roster::Roster;
+    use crate::rotation::KeyStatus;
     use crate::seal::typ;
     use weirdnet_net::user;
 
@@ -274,7 +394,11 @@ mod tests {
             roster,
             log: OpLog::new(),
             clock: None,
+            device: Some(Device::from_node_key(node_key).unwrap()),
+            keys: EpochKeys::new(),
         };
+        let mut st = st;
+        st.publish_device_key(1).unwrap();
         (Arc::new(Mutex::new(st)), node)
     }
 
@@ -400,5 +524,284 @@ mod tests {
             SyncError::Crypto(_) => {}
             other => panic!("expected wrong-user, got {other}"),
         }
+    }
+
+    type Sn = (Arc<Mutex<SyncState>>, Node<Vec<u8>, Vec<u8>>);
+
+    /// `n` linked devices of one user: every roster holds every cert, every chain every
+    /// device key (as one round of sync would leave them), each on a memory node.
+    fn linked(user: &Keypair, labels: &[&str]) -> Vec<Sn> {
+        let uid = user::user_id(&user.public());
+        let made: Vec<(Arc<Mutex<SyncState>>, Keypair)> = labels
+            .iter()
+            .map(|l| {
+                let k = Keypair::generate_ed25519();
+                (state(user, &k, &uid, l, &["bookmarks"]).0, k)
+            })
+            .collect();
+        let certs: Vec<_> = made.iter().map(|(s, _)| s.lock().unwrap().our_cert.clone()).collect();
+        let chains: Vec<_> = made.iter().map(|(s, _)| s.lock().unwrap().roster.chain.clone()).collect();
+        for (s, _) in &made {
+            let mut st = s.lock().unwrap();
+            for c in &certs {
+                st.roster.upsert(c.clone());
+            }
+            for ch in &chains {
+                st.roster.chain.merge(ch);
+            }
+        }
+        made.into_iter().map(|(s, k)| (s.clone(), start_node(k, node_config(true), s).unwrap())).collect()
+    }
+
+    fn pull(a: &Sn, b: &Sn) -> Result<usize> {
+        pull_from(&mut a.0.lock().unwrap(), &a.1, b.1.peer_id(), &addrs(&b.1), typ::BOOKMARKS)
+    }
+
+    fn head(s: &Sn) -> Option<String> {
+        s.0.lock().unwrap().roster.head_id()
+    }
+
+    fn records(s: &Sn) -> Vec<String> {
+        let st = s.0.lock().unwrap();
+        let mut v: Vec<String> = st.log.cursors().keys().flat_map(|n| st.log.iter_node(n).map(|e| e.record_id.clone()).collect::<Vec<_>>()).collect();
+        v.sort();
+        v
+    }
+
+    fn peer(s: &Sn) -> String {
+        s.1.peer_id().to_string()
+    }
+
+    #[test]
+    fn a_revoked_device_cannot_read_ops_written_after_the_rotation() {
+        let user = Keypair::generate_ed25519();
+        let g = linked(&user, &["a", "b", "c"]);
+        let (a, b, c) = (&g[0], &g[1], &g[2]);
+        a.0.lock().unwrap().local_op(1, typ::BOOKMARKS, "before", vec![1]);
+        assert_eq!(pull(c, a).unwrap(), 1, "c reads what was written before");
+
+        let rot = {
+            let mut st = a.0.lock().unwrap();
+            st.revoke(&user, &peer(c), 9).unwrap();
+            st.local_op(10, typ::BOOKMARKS, "after", vec![2]);
+            st.roster.head_id().unwrap()
+        };
+        {
+            let st = a.0.lock().unwrap();
+            let view = st.roster.chain_view();
+            let h = view.head().unwrap();
+            assert!(h.members.contains(&peer(a)) && h.members.contains(&peer(b)));
+            assert!(!h.members.contains(&peer(c)), "the revoked device is not sealed a copy");
+            assert_eq!(st.key_status(), KeyStatus::Current { epoch: h.epoch });
+        }
+
+        // B catches up through the roster reply and reads the new op.
+        assert_eq!(pull(b, a).unwrap(), 2);
+        assert_eq!(head(b).as_deref(), Some(rot.as_str()));
+        assert!(b.0.lock().unwrap().keys.has(&rot));
+
+        // C is refused, and learning the whole chain gives it no key.
+        assert!(matches!(pull(c, a), Err(SyncError::Refused(ref r)) if r == "revoked"));
+        let chain = a.0.lock().unwrap().roster.clone();
+        {
+            let mut st = c.0.lock().unwrap();
+            let key = st.user_key.clone();
+            st.roster.merge(&chain, &key, &WEIRDNET);
+            st.refresh_keys();
+            assert!(!st.keys.has(&rot));
+            assert_eq!(st.key_status(), KeyStatus::Revoked);
+        }
+
+        // B's page with the post-rotation op, as it crosses the wire.
+        let a_node = NodeId(peer(a));
+        let page_env = {
+            let bs = b.0.lock().unwrap();
+            let pull = Message::Pull(Pull { node_id: a_node.clone(), after_seq: 0, typ: typ::BOOKMARKS.into(), limit: 10 });
+            let env = bs.seal_envelope(&bs.current_key(), typ::BOOKMARKS, &peer(b), &pull).unwrap();
+            a.0.lock().unwrap().handle(&peer(b), env).unwrap()
+        };
+        match b.0.lock().unwrap().open_envelope(&page_env, &peer(b)).unwrap() {
+            Message::Page(p) => assert!(p.page.ops.iter().any(|e| e.record_id == "after")),
+            other => panic!("expected a page, got {other:?}"),
+        }
+        let cs = c.0.lock().unwrap();
+        assert!(cs.open_envelope(&page_env, &peer(b)).is_err(), "c holds the seed and every old key, and still cannot open it");
+        assert!(page_env.open(&cs.seed, &cs.user_id, &peer(b)).is_err());
+        // Nor can it pull with the seed-derived key, as itself or claiming to be B.
+        for (from, label) in [(peer(c), "as c"), (peer(b), "as b")] {
+            let pull = Message::Pull(Pull { node_id: a_node.clone(), after_seq: 0, typ: typ::BOOKMARKS.into(), limit: 10 });
+            let env = cs.seal_envelope(&KeyRef::seed(cs.roster.epoch), typ::BOOKMARKS, &from, &pull).unwrap();
+            let reply = a.0.lock().unwrap().handle(&from, env).unwrap();
+            match cs.open_envelope(&reply, &from).unwrap() {
+                Message::Refuse(r) => assert_eq!(r.reason, "epoch-behind", "{label}"),
+                other => panic!("{label}: expected a refusal, got {other:?}"),
+            }
+        }
+        drop(cs);
+
+        // A new node certified with the seed's user key (what a revoked holder can mint)
+        // gets the roster, not the key.
+        let mint = Keypair::generate_ed25519();
+        let uid = user::user_id(&user.public());
+        let (ms, _) = state(&user, &mint, &uid, "minted", &["bookmarks"]);
+        let mn = start_node(mint, node_config(true), ms.clone()).unwrap();
+        let minted = (ms, mn);
+        assert!(matches!(pull(&minted, a), Err(SyncError::Refused(ref r)) if r == "needs-admission"));
+        assert!(!records(&minted).contains(&"after".to_string()));
+    }
+
+    #[test]
+    fn the_remaining_devices_converge_after_a_rotation() {
+        let user = Keypair::generate_ed25519();
+        let g = linked(&user, &["a", "b", "c", "d"]);
+        let (a, b, c, d) = (&g[0], &g[1], &g[2], &g[3]);
+        a.0.lock().unwrap().local_op(1, typ::BOOKMARKS, "a-1", vec![1]);
+        a.0.lock().unwrap().revoke(&user, &peer(c), 5).unwrap();
+        a.0.lock().unwrap().local_op(6, typ::BOOKMARKS, "a-2", vec![2]);
+        // A pulls from B, which has not heard: B cannot open A's hello, A hands it the
+        // roster, and the pull goes through under the new key.
+        b.0.lock().unwrap().local_op(7, typ::BOOKMARKS, "b-1", vec![3]);
+        assert_eq!(pull(a, b).unwrap(), 1);
+        assert_eq!(head(b), head(a));
+        // D was offline; it catches up from B, not from A.
+        assert_eq!(pull(d, b).unwrap(), 1);
+        assert_eq!(head(d), head(a));
+        d.0.lock().unwrap().local_op(8, typ::BOOKMARKS, "d-1", vec![4]);
+        assert_eq!(pull(a, d).unwrap(), 1);
+        assert_eq!(pull(b, d).unwrap(), 1);
+        pull(b, a).unwrap();
+        pull(d, a).unwrap();
+        let want = vec!["a-1", "a-2", "b-1", "d-1"];
+        for (s, label) in [(a, "a"), (b, "b"), (d, "d")] {
+            assert_eq!(records(s), want, "{label}");
+            assert!(matches!(s.0.lock().unwrap().key_status(), KeyStatus::Current { .. }), "{label}");
+        }
+        assert!(matches!(pull(c, d), Err(SyncError::Refused(ref r)) if r == "revoked"));
+    }
+
+    #[test]
+    fn a_restored_device_is_re_admitted_and_catches_up() {
+        let user = Keypair::generate_ed25519();
+        let g = linked(&user, &["a", "b", "c"]);
+        let (a, b, c) = (&g[0], &g[1], &g[2]);
+        a.0.lock().unwrap().local_op(1, typ::BOOKMARKS, "old", vec![1]);
+        let first = {
+            let mut st = a.0.lock().unwrap();
+            st.revoke(&user, &peer(c), 2).unwrap();
+            st.roster.head_id().unwrap()
+        };
+        let second = a.0.lock().unwrap().rotate(3).unwrap();
+        a.0.lock().unwrap().local_op(4, typ::BOOKMARKS, "new", vec![2]);
+        pull(b, a).unwrap();
+
+        // Restored from the recovery words: same seed and user, a new node key.
+        let uid = user::user_id(&user.public());
+        let rk = Keypair::generate_ed25519();
+        let (rs, _) = state(&user, &rk, &uid, "restored", &["bookmarks"]);
+        let r = (rs.clone(), start_node(rk, node_config(true), rs).unwrap());
+        assert!(matches!(pull(&r, a), Err(SyncError::Refused(ref x)) if x == "needs-admission"));
+        assert_eq!(r.0.lock().unwrap().key_status(), KeyStatus::NeedsAdmission);
+        assert!(r.0.lock().unwrap().roster.head_id().is_some(), "it knows the chain moved on");
+
+        // On A the user approves it (as when linking). A learned its device key from the hello.
+        let cert = r.0.lock().unwrap().our_cert.clone();
+        let fp = r.0.lock().unwrap().roster.chain.device(&peer(&r)).unwrap().fingerprint();
+        assert_eq!(a.0.lock().unwrap().roster.chain.device(&peer(&r)).unwrap().fingerprint(), fp);
+        assert!(a.0.lock().unwrap().admit(cert, 5).unwrap());
+
+        assert_eq!(pull(&r, a).unwrap(), 2);
+        assert_eq!(records(&r), vec!["new", "old"]);
+        {
+            let st = r.0.lock().unwrap();
+            assert!(st.keys.has(&first) && st.keys.has(&second), "older epochs come along for history");
+            assert!(matches!(st.key_status(), KeyStatus::Current { .. }));
+        }
+        // It writes; B learns of it from A and then pulls from it directly.
+        r.0.lock().unwrap().local_op(6, typ::BOOKMARKS, "restored-1", vec![3]);
+        pull(b, a).unwrap();
+        assert_eq!(pull(b, &r).unwrap(), 1);
+        // A revoked device cannot be admitted again.
+        let c_cert = c.0.lock().unwrap().our_cert.clone();
+        assert!(matches!(a.0.lock().unwrap().admit(c_cert, 7), Err(SyncError::Refused(ref x)) if x == "revoked"));
+    }
+
+    #[test]
+    fn concurrent_rotations_settle_on_one_head() {
+        let user = Keypair::generate_ed25519();
+        let g = linked(&user, &["a", "b"]);
+        let (a, b) = (&g[0], &g[1]);
+        a.0.lock().unwrap().rotate(1).unwrap();
+        pull(b, a).unwrap();
+        let ra = a.0.lock().unwrap().rotate(2).unwrap();
+        let rb = b.0.lock().unwrap().rotate(2).unwrap();
+        assert_ne!(ra, rb);
+        a.0.lock().unwrap().local_op(3, typ::BOOKMARKS, "a-1", vec![1]);
+        assert_eq!(pull(b, a).unwrap(), 1);
+        pull(a, b).unwrap();
+        let h = head(a).unwrap();
+        assert_eq!(head(b).as_deref(), Some(h.as_str()));
+        assert_eq!(h, ra.clone().min(rb.clone()), "the lower id wins a tie");
+        assert!(a.0.lock().unwrap().keys.has(&ra) && a.0.lock().unwrap().keys.has(&rb));
+    }
+
+    #[test]
+    fn a_late_root_and_a_revoked_creator_do_not_move_the_head() {
+        let user = Keypair::generate_ed25519();
+        let g = linked(&user, &["a", "b", "c"]);
+        let (a, b, c) = (&g[0], &g[1], &g[2]);
+        a.0.lock().unwrap().rotate(1).unwrap();
+        pull(b, a).unwrap();
+        pull(c, a).unwrap();
+        a.0.lock().unwrap().revoke(&user, &peer(c), 2).unwrap();
+        let h = head(a).unwrap();
+        // C, unaware, rotates off the root it still holds. Its rotation stops counting
+        // once its revocation is known, so it never becomes the head.
+        c.0.lock().unwrap().rotate(3).unwrap();
+        // A seed holder with a fresh node starts its own root that includes everyone.
+        let uid = user::user_id(&user.public());
+        let mk = Keypair::generate_ed25519();
+        let (ms, _) = state(&user, &mk, &uid, "minted", &["bookmarks"]);
+        {
+            let mut m = ms.lock().unwrap();
+            let r = a.0.lock().unwrap().roster.clone();
+            let mut plain =
+                Roster { epoch: r.epoch, certs: r.certs.clone(), chain: KeyChain { devices: r.chain.devices.clone(), ..Default::default() } };
+            plain.certs.retain(|x| x.active());
+            let key = m.user_key.clone();
+            m.roster.merge(&plain, &key, &WEIRDNET);
+            m.rotate(1).unwrap();
+        }
+        let minted_cert = ms.lock().unwrap().our_cert.clone();
+        let minted_chain = ms.lock().unwrap().roster.chain.clone();
+        let c_roster = c.0.lock().unwrap().roster.clone();
+        {
+            let mut st = a.0.lock().unwrap();
+            let key = st.user_key.clone();
+            st.roster.merge(&c_roster, &key, &WEIRDNET);
+            st.roster.upsert(minted_cert);
+            st.roster.chain.merge(&minted_chain);
+            st.refresh_keys();
+            assert_eq!(st.roster.head_id().as_deref(), Some(h.as_str()));
+            assert!(!st.needs_rotation());
+        }
+    }
+
+    #[test]
+    fn a_head_that_still_includes_a_revoked_device_is_replaced() {
+        let user = Keypair::generate_ed25519();
+        let g = linked(&user, &["a", "b", "c"]);
+        let (a, b, c) = (&g[0], &g[1], &g[2]);
+        let root = a.0.lock().unwrap().rotate(1).unwrap();
+        pull(b, a).unwrap();
+        // Revoked without a rotation (a 0.2 device, or one without its node key).
+        b.0.lock().unwrap().roster.revoke(&WEIRDNET, &user, &peer(c), 2).unwrap();
+        assert!(b.0.lock().unwrap().needs_rotation());
+        pull(b, a).unwrap();
+        let h = head(b).unwrap();
+        assert_ne!(h, root);
+        assert!(!b.0.lock().unwrap().needs_rotation());
+        pull(a, b).unwrap();
+        assert_eq!(head(a).as_deref(), Some(h.as_str()));
+        assert!(!a.0.lock().unwrap().roster.chain_view().head().unwrap().members.contains(&peer(c)));
     }
 }

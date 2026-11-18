@@ -6,9 +6,10 @@
 use crate::error::{Result, SyncError};
 use crate::hlc::{Hlc, NodeId};
 use crate::log::{LogEntry, Page as LogPage};
-use crate::seal::{open_page, seal_page, sync_key};
+use crate::rotation::KeyChain;
+use crate::seal::{open_page, page_aad_keyed, rotated_sync_key, seal_page, sync_key};
 use serde::{Deserialize, Serialize};
-use weirdnet_keys::Sealed;
+use weirdnet_keys::{Key32, Sealed};
 use weirdnet_net::profile::{Profile, WEIRDNET};
 use weirdnet_net::user::NodeCert;
 use zeroize::Zeroizing;
@@ -33,6 +34,9 @@ pub struct Hello {
     pub types: Vec<String>,
     pub our_cursors: Cursors,
     pub our_hlc: Hlc,
+    /// The sender's key chain, so device keys and rotations spread. Absent from 0.2.
+    #[serde(default)]
+    pub chain: KeyChain,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,6 +45,8 @@ pub struct HelloOk {
     pub epoch: u32,
     pub cursors: Cursors,
     pub revocations: Vec<NodeCert>,
+    #[serde(default)]
+    pub chain: KeyChain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +86,9 @@ pub struct Ack {
 pub struct RosterMsg {
     pub certs: Vec<NodeCert>,
     pub epoch: u32,
+    /// Device keys, rotations (with the sealed epoch keys) and admissions.
+    #[serde(default)]
+    pub chain: KeyChain,
 }
 
 /// Application-level message, before sealing.
@@ -95,23 +104,60 @@ pub enum Message {
     Roster(RosterMsg),
 }
 
-/// What goes on the request-response wire: type and epoch in the clear, body sealed.
+/// What goes on the request-response wire: type, epoch and (after a rotation) the
+/// rotation id in the clear, body sealed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     pub typ: String,
     pub epoch: u32,
+    /// Rotation id of the epoch key; `None` for the seed-derived key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub sealed: Sealed,
 }
 
+/// Which key an envelope is sealed under: the seed-derived one at `epoch`, or the
+/// rotated one with this id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRef {
+    pub epoch: u32,
+    pub id: Option<String>,
+}
+
+impl KeyRef {
+    pub fn seed(epoch: u32) -> Self {
+        Self { epoch, id: None }
+    }
+}
+
 impl Envelope {
+    /// Seal under a rotated epoch key (rotation `id`).
+    pub fn seal_keyed(epoch_key: &Key32, id: &str, user_id: &str, typ: &str, epoch: u32, asking_peer: &str, msg: &Message) -> Result<Self> {
+        let key = rotated_sync_key(epoch_key, user_id, typ, epoch, id)?;
+        let plain = encode(msg)?;
+        let sealed = weirdnet_keys::seal(&key, &plain, &page_aad_keyed(typ, epoch, id, asking_peer))?;
+        Ok(Self { typ: typ.into(), epoch, key: Some(id.into()), sealed })
+    }
+
+    pub fn open_keyed(&self, epoch_key: &Key32, user_id: &str, asking_peer: &str) -> Result<Message> {
+        let id = self.key.as_deref().ok_or_else(|| SyncError::Crypto("not sealed under a rotated key".into()))?;
+        let key = rotated_sync_key(epoch_key, user_id, &self.typ, self.epoch, id)?;
+        let plain: Zeroizing<Vec<u8>> = weirdnet_keys::open(&key, &self.sealed, &page_aad_keyed(&self.typ, self.epoch, id, asking_peer))?;
+        decode(&plain)
+    }
+
     pub fn seal(seed: &[u8], user_id: &str, typ: &str, epoch: u32, asking_peer: &str, msg: &Message) -> Result<Self> {
         let key = sync_key(seed, user_id, typ, epoch)?;
         let plain = encode(msg)?;
         let sealed = seal_page(&key, typ, epoch, asking_peer, &plain)?;
-        Ok(Self { typ: typ.into(), epoch, sealed })
+        Ok(Self { typ: typ.into(), epoch, key: None, sealed })
     }
 
+    /// Open a seed-sealed envelope. One sealed under a rotated key fails here.
     pub fn open(&self, seed: &[u8], user_id: &str, asking_peer: &str) -> Result<Message> {
+        if self.key.is_some() {
+            return Err(SyncError::Crypto("sealed under a rotated key".into()));
+        }
         let key = sync_key(seed, user_id, &self.typ, self.epoch)?;
         let plain: Zeroizing<Vec<u8>> = open_page(&key, &self.typ, self.epoch, asking_peer, &self.sealed)?;
         decode(&plain)
@@ -180,6 +226,7 @@ mod tests {
             types: vec!["bookmarks".into()],
             our_cursors: vec![(NodeId::new("peer-a"), 3)],
             our_hlc: Hlc::new(10, 0, NodeId::new("peer-a")),
+            chain: Default::default(),
         });
         (msg, uid, u)
     }

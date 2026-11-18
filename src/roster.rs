@@ -2,8 +2,10 @@
 //!
 //! Certificates themselves are created and checked by [`weirdnet_net::user`] /
 //! [`Profile::certify`]. This module keeps the set, bumps the epoch on revoke, and
-//! decides whether a peer may start a sync session.
+//! decides whether a peer may start a sync session. The key chain ([`KeyChain`]: device
+//! keys, rotations and admissions) travels with the roster; see [`crate::rotation`].
 use crate::error::{Result, SyncError};
+use crate::rotation::KeyChain;
 use serde::{Deserialize, Serialize};
 use weirdnet_net::profile::{Profile, WEIRDNET};
 use weirdnet_net::user::{self, NodeCert};
@@ -14,6 +16,9 @@ use weirdnet_net::{Keypair, PublicKey};
 pub struct Roster {
     pub epoch: u32,
     pub certs: Vec<NodeCert>,
+    /// Device keys, rotations and admissions (public; sealed epoch keys inside).
+    #[serde(default, skip_serializing_if = "KeyChain::is_empty_and_rootless")]
+    pub chain: KeyChain,
 }
 
 impl Roster {
@@ -44,8 +49,9 @@ impl Roster {
         self.certs.iter().filter(|c| c.active())
     }
 
-    /// Sign a revocation, attach it to the cert, and bump the key epoch so the revoked
-    /// node cannot decrypt later pages even if it still has an old `SyncKey`.
+    /// Sign a revocation, attach it to the cert, and bump the key epoch. This alone does
+    /// not shut out a device that holds the seed: use [`crate::SyncState::revoke`], which
+    /// also rotates to a random epoch key.
     pub fn revoke(&mut self, profile: &Profile, user: &Keypair, peer_id: &str, at_ms: i64) -> Result<NodeCert> {
         let uid = user::user_id(&user.public());
         let sig = profile.revoke(user, &uid, peer_id, at_ms)?;
@@ -59,10 +65,11 @@ impl Roster {
         Ok(cert.clone())
     }
 
-    /// Merge another replica's certs. A signed revocation wins over a still-active copy
-    /// of the same cert. The epoch is the max of the two.
+    /// Merge another replica's certs and key chain. A signed revocation wins over a
+    /// still-active copy of the same cert. The epoch is the max of the two.
     pub fn merge(&mut self, other: &Roster, key: &PublicKey, profile: &Profile) {
         self.epoch = self.epoch.max(other.epoch);
+        self.chain.merge(&other.chain);
         for c in &other.certs {
             if !profile.verify_cert(key, c) {
                 continue;
