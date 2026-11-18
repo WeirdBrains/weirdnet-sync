@@ -158,6 +158,9 @@ impl SyncState {
         if !h.chain.is_empty() {
             self.roster.chain.merge(&h.chain);
             self.refresh_keys();
+            // A device the user approved here, saying hello for the first time: admit it
+            // now, so the roster reply below already carries its admission.
+            self.admit_approved(now_ms() as i64);
         }
         if (rotated && !at_head) || check == SessionCheck::EpochBehind {
             // A valid, unrevoked device of this user that missed a revocation or a
@@ -720,6 +723,17 @@ mod tests {
         r.0.lock().unwrap().local_op(6, typ::BOOKMARKS, "restored-1", vec![3]);
         pull(b, a).unwrap();
         assert_eq!(pull(b, &r).unwrap(), 1);
+        // A device approved before its key is known (the link flow) is admitted by its
+        // first hello and catches up in that same pull.
+        let rk2 = Keypair::generate_ed25519();
+        let (rs2, _) = state(&user, &rk2, &uid, "restored-2", &["bookmarks"]);
+        let r2 = (rs2.clone(), start_node(rk2, node_config(true), rs2).unwrap());
+        let cert2 = r2.0.lock().unwrap().our_cert.clone();
+        assert!(!a.0.lock().unwrap().approve(cert2, 8).unwrap(), "no device key yet");
+        assert_eq!(a.0.lock().unwrap().roster.chain.approved, vec![peer(&r2)]);
+        assert_eq!(pull(&r2, a).unwrap(), 2);
+        assert!(a.0.lock().unwrap().roster.chain.approved.is_empty());
+        assert!(a.0.lock().unwrap().roster.chain_view().head().unwrap().members.contains(&peer(&r2)));
         // A revoked device cannot be admitted again.
         let c_cert = c.0.lock().unwrap().our_cert.clone();
         assert!(matches!(a.0.lock().unwrap().admit(c_cert, 7), Err(SyncError::Refused(ref x)) if x == "revoked"));

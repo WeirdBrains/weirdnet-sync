@@ -232,6 +232,10 @@ pub struct KeyChain {
     /// The root this device follows, once it holds a key from it. Local; never merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
+    /// Devices the user approved on this device (by linking) that wait for an
+    /// admission. Local; never merged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved: Vec<String>,
 }
 
 impl KeyChain {
@@ -240,7 +244,7 @@ impl KeyChain {
     }
 
     pub fn is_empty_and_rootless(&self) -> bool {
-        self.is_empty() && self.root.is_none()
+        self.is_empty() && self.root.is_none() && self.approved.is_empty()
     }
 
     pub fn device(&self, peer_id: &str) -> Option<&DeviceKey> {
@@ -280,9 +284,9 @@ impl KeyChain {
         }
     }
 
-    /// This chain without the local `root`, for the wire.
+    /// This chain without the local `root` and `approved`, for the wire.
     pub fn shared(&self) -> KeyChain {
-        KeyChain { root: None, ..self.clone() }
+        KeyChain { root: None, approved: Vec::new(), ..self.clone() }
     }
 }
 
@@ -598,11 +602,12 @@ impl SyncState {
         }
         let view = self.roster.chain_view();
         let active: BTreeSet<String> = self.roster.active().map(|c| c.peer_id.clone()).collect();
-        let (parent, epoch, candidates): (Option<String>, u32, BTreeSet<String>) = match view.head() {
+        let (parent, epoch, mut candidates): (Option<String>, u32, BTreeSet<String>) = match view.head() {
             Some(h) if !self.keys.has(&h.id) => return Err(SyncError::Refused("needs-admission".into())),
             Some(h) => (Some(h.id.clone()), h.epoch.saturating_add(1), h.members.clone()),
             None => (None, self.roster.epoch.saturating_add(1), active.clone()),
         };
+        candidates.extend(self.roster.chain.approved.iter().cloned());
         let key = Key32::random()?;
         let eph = ExchangeSecret::generate();
         let mut r = Rotation {
@@ -645,8 +650,55 @@ impl SyncState {
         Ok(cert)
     }
 
+    /// The user approved this device here (as when linking it). It is admitted now if
+    /// its device key is known, otherwise as soon as one of its hellos brings the key.
+    /// Returns whether it was admitted now.
+    pub fn approve(&mut self, cert: NodeCert, at_ms: i64) -> Result<bool> {
+        if !WEIRDNET.verify_cert(&self.user_key, &cert) || !cert.active() || cert.user_id != self.user_id {
+            return Err(SyncError::Refused("wrong-user".into()));
+        }
+        if self.roster.get(&cert.peer_id).is_some_and(|c| !c.active()) {
+            return Err(SyncError::Refused("revoked".into()));
+        }
+        let peer = cert.peer_id.clone();
+        self.roster.upsert(cert);
+        if !self.roster.chain.approved.contains(&peer) {
+            self.roster.chain.approved.push(peer.clone());
+        }
+        Ok(self.admit_approved(at_ms).contains(&peer))
+    }
+
+    /// Admit every approved device whose device key is known and that is not yet a
+    /// member of the head. Members and revoked devices leave the list. Returns the
+    /// devices admitted.
+    pub fn admit_approved(&mut self, at_ms: i64) -> Vec<String> {
+        let mut admitted = Vec::new();
+        if self.roster.chain.approved.is_empty() || self.device.is_none() {
+            return admitted;
+        }
+        for peer in self.roster.chain.approved.clone() {
+            let view = self.roster.chain_view();
+            let Some(head) = view.head() else { break };
+            if !self.keys.has(&head.id) {
+                break;
+            }
+            let done = head.members.contains(&peer) || self.roster.get(&peer).is_none_or(|c| !c.active());
+            if !done
+                && self.roster.chain.device(&peer).is_some()
+                && let Some(cert) = self.roster.get(&peer).cloned()
+                && self.admit(cert, at_ms).unwrap_or(false)
+            {
+                admitted.push(peer.clone());
+            }
+            if done || admitted.contains(&peer) {
+                self.roster.chain.approved.retain(|p| p != &peer);
+            }
+        }
+        admitted
+    }
+
     /// Let a device back in (after the user approved it on this device, as when
-    /// linking): seal the head key and the older keys this device holds to its device
+    /// linking; [`SyncState::approve`] waits for its device key): seal the head key and the older keys this device holds to its device
     /// key. Returns false when there is nothing to admit to (no rotation yet: the seed
     /// is enough).
     pub fn admit(&mut self, cert: NodeCert, at_ms: i64) -> Result<bool> {
