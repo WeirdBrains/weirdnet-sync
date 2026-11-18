@@ -9,6 +9,7 @@ All notable changes to weirdnet-sync are listed here. The format follows
 ### Fixed
 
 - Two devices that each started the first rotation before learning of the other (linking two devices before either synced) no longer split into two chains for good: the earliest root whose creator the followed chain trusts wins, and a device in both chains admits the devices it approved into both (`Roster::all_views`).
+- Revoking the device that made the first rotation no longer drops the whole chain: a revoked device's rotations still count when an active device built on them, and `revoke` rotates on the head from before the revocation.
 
 ## [0.3.0] - 2026-11-18
 

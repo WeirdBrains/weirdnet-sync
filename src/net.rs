@@ -860,6 +860,33 @@ mod tests {
     }
 
     #[test]
+    fn revoking_the_device_that_started_the_chain_keeps_the_chain() {
+        let user = Keypair::generate_ed25519();
+        let g = linked(&user, &["a", "b", "c"]);
+        let (a, b, c) = (&g[0], &g[1], &g[2]);
+        let root = c.0.lock().unwrap().rotate(1).unwrap();
+        pull(a, c).unwrap();
+        pull(b, c).unwrap();
+        a.0.lock().unwrap().revoke(&user, &peer(c), 2).unwrap();
+        let h = head(a).unwrap();
+        assert_ne!(h, root);
+        assert_eq!(a.0.lock().unwrap().roster.chain_view().root.as_deref(), Some(root.as_str()), "the chain C started lives on");
+        a.0.lock().unwrap().local_op(3, typ::BOOKMARKS, "a-1", vec![1]);
+        pull(b, a).unwrap();
+        assert_eq!(head(b).as_deref(), Some(h.as_str()));
+        assert!(matches!(b.0.lock().unwrap().key_status(), KeyStatus::Current { .. }));
+        assert_eq!(records(b), vec!["a-1"]);
+        // What C makes on its own after the revocation does not count.
+        let _ = pull(c, a);
+        let _ = c.0.lock().unwrap().rotate(4);
+        let c_roster = c.0.lock().unwrap().roster.clone();
+        let mut st = a.0.lock().unwrap();
+        st.roster.chain.merge(&c_roster.chain);
+        assert_eq!(st.roster.head_id().as_deref(), Some(h.as_str()));
+        assert!(!c.0.lock().unwrap().keys.has(&h));
+    }
+
+    #[test]
     fn a_head_that_still_includes_a_revoked_device_is_replaced() {
         let user = Keypair::generate_ed25519();
         let g = linked(&user, &["a", "b", "c"]);

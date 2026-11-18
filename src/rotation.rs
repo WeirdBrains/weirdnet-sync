@@ -13,8 +13,10 @@
 //!   one holding the user key) can swap in its own exchange key.
 //! - A [`Rotation`] is signed by its creator's node key. It is valid when the creator has
 //!   an active cert and is a member of the parent rotation, and its epoch is the parent's
-//!   plus one. A root (no parent) is valid when its creator has an active cert. A
-//!   revoked creator's rotations stop counting, with everything built on them.
+//!   plus one. A root (no parent) is valid when its creator is a member of it. A
+//!   revoked creator's rotations count only when an active device built on them, so a
+//!   chain started by a device revoked later lives on, and whatever a revoked device
+//!   makes on its own drops out.
 //! - Once a device holds a key from a root it keeps that root ([`KeyChain::root`]); a
 //!   later root from someone holding only the seed is ignored. Two devices can each
 //!   start a root before they know of each other; a root whose creator is a member of
@@ -336,7 +338,8 @@ impl Roster {
 
     fn signed_parts(&self) -> (Vec<Ided<'_, Rotation>>, Vec<Ided<'_, Admission>>) {
         let active = self.active_set();
-        let rots = self.chain.rotations.iter().filter(|r| active.contains(r.by.as_str()) && r.signed()).map(|r| (r.id(), r)).collect();
+        let known: BTreeSet<&str> = self.certs.iter().map(|c| c.peer_id.as_str()).collect();
+        let rots = self.chain.rotations.iter().filter(|r| known.contains(r.by.as_str()) && r.signed()).map(|r| (r.id(), r)).collect();
         let adms = self.chain.admissions.iter().filter(|a| active.contains(a.by.as_str()) && a.signed()).map(|a| (a.id(), a)).collect();
         (rots, adms)
     }
@@ -433,6 +436,29 @@ impl Roster {
                 break;
             }
         }
+        // A revoked device's rotations count only when a device still active built on
+        // them (so the chain it started before its revocation lives on); whatever it
+        // made on its own, unaware or not, drops out with it.
+        let parent: BTreeMap<&str, Option<&str>> = rots.iter().map(|(id, r)| (id.as_str(), r.parent.as_deref())).collect();
+        let mut keep: BTreeSet<String> = BTreeSet::new();
+        for (id, r) in rots {
+            if !view.valid.contains_key(id) || revoked.contains(r.by.as_str()) {
+                continue;
+            }
+            let mut cur = Some(id.as_str());
+            while let Some(c) = cur {
+                if !keep.insert(c.to_string()) {
+                    break;
+                }
+                cur = parent.get(c).copied().flatten();
+            }
+        }
+        view.valid.retain(|id, _| keep.contains(id));
+        if view.valid.is_empty() {
+            return ChainView::default();
+        }
+        let kept_adm: BTreeSet<String> = adms.iter().filter(|(_, a)| view.valid.contains_key(&a.rotation)).map(|(id, _)| id.clone()).collect();
+        admitted.retain(|id| kept_adm.contains(id));
         view.admissions = admitted;
         view.head = view
             .valid
@@ -670,13 +696,19 @@ impl SyncState {
     /// Make a fresh random epoch key and seal it to every remaining device that has
     /// published a device key. Returns the new rotation id.
     pub fn rotate(&mut self, at_ms: i64) -> Result<String> {
+        let view = self.roster.chain_view();
+        self.rotate_on(&view, at_ms)
+    }
+
+    /// Rotate on top of `view`'s head (taken before a revocation, whose creator's
+    /// rotations would otherwise drop out of the view until someone builds on them).
+    fn rotate_on(&mut self, view: &ChainView, at_ms: i64) -> Result<String> {
         let device = self.device.clone().ok_or_else(|| SyncError::Protocol("no device key".into()))?;
         let me = device.peer_id();
         self.publish_device_key(at_ms)?;
         if self.key_status() == KeyStatus::Revoked {
             return Err(SyncError::Refused("revoked".into()));
         }
-        let view = self.roster.chain_view();
         let active: BTreeSet<String> = self.roster.active().map(|c| c.peer_id.clone()).collect();
         let (parent, epoch, mut candidates): (Option<String>, u32, BTreeSet<String>) = match view.head() {
             Some(h) if !self.keys.has(&h.id) => return Err(SyncError::Refused("needs-admission".into())),
@@ -719,9 +751,10 @@ impl SyncState {
     /// Revoke a device and, when this state has a device key, rotate so the revoked
     /// device cannot read anything written afterwards even though it holds the seed.
     pub fn revoke(&mut self, user: &Keypair, peer_id: &str, at_ms: i64) -> Result<NodeCert> {
+        let before = self.roster.chain_view();
         let cert = self.roster.revoke(&WEIRDNET, user, peer_id, at_ms)?;
         if self.device.is_some() {
-            self.rotate(at_ms)?;
+            self.rotate_on(&before, at_ms)?;
         }
         Ok(cert)
     }
