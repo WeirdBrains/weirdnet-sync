@@ -38,6 +38,8 @@ pub struct OpLog {
     next: HashMap<String, u64>,
     /// Last seq applied from each peer.
     cursors: HashMap<String, u64>,
+    /// Per (node, type): every op of that type with `seq <=` this is applied.
+    type_cursors: HashMap<(String, String), u64>,
 }
 
 impl OpLog {
@@ -59,6 +61,70 @@ impl OpLog {
 
     pub fn set_cursor(&mut self, node: &NodeId, last_seq: u64) {
         self.cursors.insert(node.0.clone(), last_seq);
+    }
+
+    /// How far this log holds every op of `typ` from `node`: the explicit
+    /// per-type cursor, or the contiguous prefix of `node`'s entries (all
+    /// types), whichever is further. A pull of one type resumes from here.
+    pub fn cursor_for(&self, node: &NodeId, typ: &str) -> u64 {
+        let explicit = self.type_cursors.get(&(node.0.clone(), typ.to_string())).copied().unwrap_or(0);
+        explicit.max(self.contiguous(node))
+    }
+
+    pub fn set_cursor_for(&mut self, node: &NodeId, typ: &str, last_seq: u64) {
+        self.type_cursors.insert((node.0.clone(), typ.to_string()), last_seq);
+    }
+
+    /// Per-type cursors, for an application to persist next to [`OpLog::cursors`].
+    pub fn type_cursors(&self) -> HashMap<(NodeId, String), u64> {
+        self.type_cursors.iter().map(|((n, t), v)| ((NodeId(n.clone()), t.clone()), *v)).collect()
+    }
+
+    /// Highest `k` such that every seq `1..=k` of `node` is held.
+    pub fn contiguous(&self, node: &NodeId) -> u64 {
+        let mut k = 0;
+        for e in self.iter_node(node) {
+            if e.seq != k + 1 {
+                break;
+            }
+            k = e.seq;
+        }
+        k
+    }
+
+    /// The newest HLC held from any node.
+    pub fn newest_hlc(&self) -> Option<&Hlc> {
+        self.entries.values().map(|e| &e.hlc).max_by(|a, b| a.cmp_total(b))
+    }
+
+    /// Ops of `typ` from `node` with `after_seq < seq <= known_to`, up to `limit` ops and
+    /// [`PAGE_MAX`] bytes. Missing seqs in that range are other types and are skipped, so
+    /// `known_to` must be [`OpLog::cursor_for`] (or less). `to_seq` is the last seq walked,
+    /// which may be past the last op returned; a puller resumes after it.
+    pub fn page_of_type(&self, node: &NodeId, typ: &str, after_seq: u64, known_to: u64, limit: usize) -> Page {
+        let mut ops = Vec::new();
+        let mut bytes = 0usize;
+        let mut to_seq = after_seq;
+        if known_to > after_seq {
+            let mut full = false;
+            for (_, e) in self.entries.range((node.0.clone(), after_seq + 1)..=(node.0.clone(), known_to)) {
+                if e.typ == typ {
+                    let add = 64 + e.typ.len() + e.record_id.len() + e.op.len();
+                    if !ops.is_empty() && (ops.len() >= limit || bytes + add > PAGE_MAX) {
+                        full = true;
+                        break;
+                    }
+                    bytes += add;
+                    ops.push(e.clone());
+                }
+                to_seq = e.seq;
+            }
+            if !full {
+                to_seq = known_to;
+            }
+        }
+        let from_seq = ops.first().map(|e| e.seq).unwrap_or(after_seq);
+        Page { node_id: node.clone(), from_seq, to_seq, ops }
     }
 
     /// Append a local mutation. `seq` is assigned here.
@@ -169,6 +235,45 @@ mod tests {
         assert_eq!(log.integrate(&remote), 0);
         assert_eq!(log.get(&n("a"), 1).unwrap().op, b"add");
         assert_eq!(log.len(), 3);
+    }
+
+    #[test]
+    fn typed_pages_skip_other_types_and_resume_past_them() {
+        let mut log = OpLog::new();
+        log.append(n("a"), h(1, "a"), "bookmarks", "b1", vec![1]);
+        log.append(n("a"), h(2, "a"), "history", "v1", vec![2]);
+        log.append(n("a"), h(3, "a"), "bookmarks", "b2", vec![3]);
+        log.append(n("a"), h(4, "a"), "history", "v2", vec![4]);
+        log.append(n("a"), h(5, "a"), "bookmarks", "b3", vec![5]);
+        let known = log.cursor_for(&n("a"), "history");
+        assert_eq!(known, 5, "an authored stream is contiguous");
+        let p = log.page_of_type(&n("a"), "history", 0, known, 1);
+        assert_eq!(p.ops.iter().map(|e| e.seq).collect::<Vec<_>>(), [2]);
+        assert_eq!(p.to_seq, 3, "stops before the next op of the type that did not fit");
+        let p = log.page_of_type(&n("a"), "history", p.to_seq, known, 10);
+        assert_eq!(p.ops.iter().map(|e| e.seq).collect::<Vec<_>>(), [4]);
+        assert_eq!(p.to_seq, 5, "walks past trailing ops of other types");
+        let p = log.page_of_type(&n("a"), "history", 5, known, 10);
+        assert!(p.ops.is_empty());
+        assert_eq!(p.to_seq, 5);
+    }
+
+    #[test]
+    fn a_relayed_stream_is_served_only_as_far_as_it_is_known() {
+        let mut log = OpLog::new();
+        // We hold a's bookmarks 1 and 3 but not history 2 (never pulled).
+        let e = |seq, typ: &str| LogEntry { node_id: n("a"), seq, hlc: h(seq, "a"), typ: typ.into(), record_id: format!("r{seq}"), op: vec![] };
+        log.integrate(&Page { node_id: n("a"), from_seq: 1, to_seq: 3, ops: vec![e(1, "bookmarks"), e(3, "bookmarks")] });
+        assert_eq!(log.contiguous(&n("a")), 1);
+        assert_eq!(log.cursor_for(&n("a"), "history"), 1, "history 2 is unknown, not absent");
+        log.set_cursor_for(&n("a"), "bookmarks", 3);
+        assert_eq!(log.cursor_for(&n("a"), "bookmarks"), 3);
+        let p = log.page_of_type(&n("a"), "bookmarks", 0, 3, 10);
+        assert_eq!(p.ops.len(), 2);
+        assert_eq!(p.to_seq, 3);
+        assert!(log.page_of_type(&n("a"), "history", 0, log.cursor_for(&n("a"), "history"), 10).ops.is_empty());
+        assert_eq!(log.type_cursors().len(), 1);
+        assert_eq!(log.newest_hlc().unwrap().physical_ms, 3);
     }
 
     #[test]
