@@ -48,4 +48,9 @@ A revocation bumps the roster epoch. A hello from an unrevoked device of the sam
 
 ## Status
 
-Published on crates.io. Key rotation is on `main` and not yet released.
+Published on crates.io; the current release is 0.3.1. Key rotation on revoke shipped in 0.3.0:
+revoking a device rotates to a random epoch key sealed to each remaining device, so a revoked
+device that holds the seed cannot read later ops. 0.3.1 fixes two cases: two devices that each
+started the first rotation before learning of the other no longer split into two chains for
+good, and revoking the device that made the first rotation no longer drops the whole chain.
+See `CHANGELOG.md`.
