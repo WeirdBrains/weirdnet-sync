@@ -77,9 +77,10 @@ A revocation bumps the roster epoch. A hello from an unrevoked device of the sam
 
 ## Status
 
-Published on crates.io; the current release is 0.3.1. Key rotation on revoke shipped in 0.3.0:
-revoking a device rotates to a random epoch key sealed to each remaining device, so a revoked
-device that holds the seed cannot read later ops. 0.3.1 fixes two cases: two devices that each
-started the first rotation before learning of the other no longer split into two chains for
-good, and revoking the device that made the first rotation no longer drops the whole chain.
+Published on crates.io; the current release is 0.4.0. It adds large records (values over
+`Limits::inline_max` are split into BLAKE3-checked chunks) and sealed records (per-record keys
+from the head epoch key, so a device revoked before a write cannot read it), budgets pages so a
+full page fits the 256 KiB reply cap, adds `Roster::check_caller`, and moves to weirdnet-net 0.7.
+Peers on 0.3 keep working and see the fallback value. Key rotation on revoke shipped in 0.3.0,
+with two fixes in 0.3.1.
 See `CHANGELOG.md`.
