@@ -6,6 +6,17 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `SyncState` is `Clone`, and `SyncState::snapshot` copies it to pull into without holding a shared lock.
+- `SyncState::merge_back(&snapshot) -> MergeOutcome`: folds a pulled snapshot back without losing what the state learned or wrote meanwhile: the roster (revocations win; nothing is un-revoked), epoch keys and the adopted root (then keys the merged chain seals to this device), log entries through `OpLog::integrate`, peer and per-type cursors, and the clock.
+- `pull_from_shared(&Mutex<SyncState>, ..)`: snapshot, pull, merge back, so the lock is never held across the network and two nodes can pull from each other at once.
+- `PullOutcome { applied, error }` (non-exhaustive) and `pull_from_outcome`: the entries applied before a later page was refused, the network failed or the closing rotation failed. `pull_from` keeps its signature (and still keeps the applied pages on an error).
+
+### Deprecated
+
+- `SyncState::take_keys_from`: use `SyncState::merge_back`.
+
 ## [0.5.0] - 2026-11-19
 
 ### Changed

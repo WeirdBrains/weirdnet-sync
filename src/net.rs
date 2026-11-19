@@ -15,6 +15,11 @@ use weirdnet_net::user::NodeCert;
 use weirdnet_net::{Handler, Keypair, Multiaddr, Node, NodeConfig, PeerId, PublicKey, WEIRDNET};
 
 /// Mutable state a sync node answers from and applies pages into.
+///
+/// `Clone` (and [`SyncState::snapshot`]) copies everything, secrets included: pull into a
+/// snapshot without holding the shared lock, then fold it back with
+/// [`SyncState::merge_back`] (or let [`pull_from_shared`] do both).
+#[derive(Clone)]
 pub struct SyncState {
     pub seed: Vec<u8>,
     pub user_id: String,
@@ -111,11 +116,88 @@ impl SyncState {
 
     /// Take the epoch keys (and adopted root) another copy of this state picked up,
     /// for apps that pull into a snapshot and fold it back. Merge the roster as well.
+    #[deprecated(since = "0.5.1", note = "use `SyncState::merge_back`, which also merges the roster, the log, cursors and the clock")]
     pub fn take_keys_from(&mut self, other: &SyncState) {
+        self.merge_keys(other);
+    }
+
+    fn merge_keys(&mut self, other: &SyncState) -> usize {
+        let before = self.keys.len();
         self.keys.merge(&other.keys);
         if self.roster.chain.root.is_none() {
             self.roster.chain.root = other.roster.chain.root.clone();
         }
+        self.keys.len() - before
+    }
+
+    /// A copy of this state to pull into without holding the shared lock (see
+    /// [`pull_from_shared`]). Fold it back with [`SyncState::merge_back`]. Write locally
+    /// to the shared state, not to the snapshot.
+    pub fn snapshot(&self) -> SyncState {
+        self.clone()
+    }
+
+    /// Fold a snapshot that was pulled into (or that otherwise moved on) back into this
+    /// state, without losing anything this state learned or wrote meanwhile:
+    ///
+    /// - the roster: user-signed certs and revocations merge as on the wire, so a
+    ///   revocation on either side wins and nothing is un-revoked; the epoch is the max;
+    ///   the key chain (device keys, rotations, admissions) merges;
+    /// - epoch keys and the adopted root (what `take_keys_from` did), then any key the
+    ///   merged chain seals to this device; approved devices the snapshot admitted
+    ///   leave this state's approval list;
+    /// - log entries this state lacks (through [`OpLog::integrate`], so chunk and blob
+    ///   indexes follow), and every peer and per-type cursor moves to the further of the
+    ///   two;
+    /// - the clock: the later of the two, then past every op now held.
+    ///
+    /// Configuration (types, record options, the device, `auto_first_rotation`) stays
+    /// this state's.
+    pub fn merge_back(&mut self, pulled: &SyncState) -> MergeOutcome {
+        let mut out = MergeOutcome::default();
+        let revoked_before = self.roster.certs.iter().filter(|c| !c.active()).count();
+        let key = self.user_key.clone();
+        self.roster.merge(&pulled.roster, &key, &WEIRDNET);
+        out.revocations = self.roster.certs.iter().filter(|c| !c.active()).count() - revoked_before;
+        out.keys = self.merge_keys(pulled);
+        out.keys += self.refresh_keys();
+        let admitted: Vec<&str> = pulled.roster.chain.admissions.iter().map(|a| a.peer_id.as_str()).collect();
+        let still = &pulled.roster.chain.approved;
+        self.roster.chain.approved.retain(|p| still.contains(p) || !admitted.contains(&p.as_str()));
+        // Entries, a page per node (the log iterates by node, then seq).
+        let mut run: Vec<crate::log::LogEntry> = Vec::new();
+        for e in pulled.log.iter() {
+            if run.first().is_some_and(|f| f.node_id != e.node_id) {
+                out.entries += self.integrate_run(std::mem::take(&mut run));
+            }
+            if self.log.get(&e.node_id, e.seq).is_none() {
+                run.push(e.clone());
+            }
+        }
+        out.entries += self.integrate_run(run);
+        for (node, seq) in pulled.log.cursors() {
+            if seq > self.log.cursor(&node) {
+                self.log.set_cursor(&node, seq);
+            }
+        }
+        for ((node, typ), seq) in pulled.log.type_cursors() {
+            if seq > self.log.cursor_for(&node, &typ) {
+                self.log.set_cursor_for(&node, &typ, seq);
+            }
+        }
+        if let Some(theirs) = &pulled.clock
+            && self.clock.as_ref().is_none_or(|ours| theirs.cmp_total(ours).is_gt())
+        {
+            self.clock = Some(Hlc::receive(self.clock.as_ref(), theirs, now_ms(), self.our_node.clone()));
+        }
+        observe(self, now_ms());
+        out
+    }
+
+    fn integrate_run(&mut self, ops: Vec<crate::log::LogEntry>) -> usize {
+        let (Some(first), Some(last)) = (ops.first(), ops.last()) else { return 0 };
+        let page = crate::log::Page { node_id: first.node_id.clone(), from_seq: first.seq, to_seq: last.seq, ops: ops.clone() };
+        self.log.integrate(&page)
     }
 
     fn is_revoked(&self, peer: &str) -> bool {
@@ -240,6 +322,46 @@ impl Handler<Vec<u8>, Vec<u8>> for SyncHandler {
     }
 }
 
+/// What [`SyncState::merge_back`] took from the snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MergeOutcome {
+    /// Log entries this state did not hold.
+    pub entries: usize,
+    /// Epoch keys this state did not hold (taken over or newly opened).
+    pub keys: usize,
+    /// Certs that became revoked here.
+    pub revocations: usize,
+}
+
+/// The result of a pull that may have applied pages before it failed.
+///
+/// A pull applies and acks page by page, so a refusal or a network error on a later
+/// page (or a rotation after the pull) leaves the earlier pages applied, cursors moved:
+/// `applied` counts them either way, and `error` says why the pull stopped early.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct PullOutcome {
+    /// New log entries stored, before any error.
+    pub applied: usize,
+    /// Why the pull stopped, if it did not finish.
+    pub error: Option<SyncError>,
+}
+
+impl PullOutcome {
+    pub fn is_ok(&self) -> bool {
+        self.error.is_none()
+    }
+
+    /// `Ok(applied)`, or the error (dropping the count, as [`pull_from`] does).
+    pub fn into_result(self) -> Result<usize> {
+        match self.error {
+            None => Ok(self.applied),
+            Some(e) => Err(e),
+        }
+    }
+}
+
 fn error_bytes(msg: &str) -> Vec<u8> {
     encode(&Message::Refuse(Refuse { reason: format!("codec:{msg}") })).unwrap_or_default()
 }
@@ -267,7 +389,51 @@ pub fn start_node(key: Keypair, cfg: NodeConfig, state: Arc<Mutex<SyncState>>) -
 /// that still includes a revoked device. Fails with `Refused("needs-admission")` when
 /// the chain has moved on without this device (restored from the seed): another device
 /// has to [`SyncState::admit`] it.
+///
+/// On an error the pages applied before it stay applied; [`pull_from_outcome`] also
+/// reports how many there were.
 pub fn pull_from(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: PeerId, addrs: &[Multiaddr], typ_name: &str) -> Result<usize> {
+    pull_from_outcome(state, node, peer, addrs, typ_name).into_result()
+}
+
+/// [`pull_from`], reporting the entries applied even when the pull stops early (a later
+/// page refused, the network gone, a rotation failing).
+pub fn pull_from_outcome(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: PeerId, addrs: &[Multiaddr], typ_name: &str) -> PullOutcome {
+    let mut applied = 0;
+    let error = pull_session(state, node, peer, addrs, typ_name, &mut applied).err();
+    PullOutcome { applied, error }
+}
+
+/// Pull for a state shared with this node's [`SyncHandler`], without holding its lock
+/// across the network: snapshot, pull into the snapshot, then
+/// [`SyncState::merge_back`] (also after an error, so pages already applied are kept).
+///
+/// Holding the lock for the whole pull (as `pull_from(&mut state.lock()..)` does) stops
+/// this node answering meanwhile, and two nodes pulling from each other at once then
+/// wait on each other until the request times out.
+pub fn pull_from_shared(state: &Mutex<SyncState>, node: &Node<Vec<u8>, Vec<u8>>, peer: PeerId, addrs: &[Multiaddr], typ_name: &str) -> PullOutcome {
+    let mut snap = match state.lock() {
+        Ok(st) => st.snapshot(),
+        Err(_) => return PullOutcome { applied: 0, error: Some(SyncError::Protocol("sync state lock poisoned".into())) },
+    };
+    let out = pull_from_outcome(&mut snap, node, peer, addrs, typ_name);
+    match state.lock() {
+        Ok(mut st) => {
+            st.merge_back(&snap);
+            out
+        }
+        Err(_) => PullOutcome { applied: out.applied, error: Some(SyncError::Protocol("sync state lock poisoned".into())) },
+    }
+}
+
+fn pull_session(
+    state: &mut SyncState,
+    node: &Node<Vec<u8>, Vec<u8>>,
+    peer: PeerId,
+    addrs: &[Multiaddr],
+    typ_name: &str,
+    applied: &mut usize,
+) -> Result<()> {
     let from = node.peer_id().to_string();
     let mut catch_ups = 0;
     let mut pushed = false;
@@ -320,16 +486,16 @@ pub fn pull_from(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: Pee
         let env = state.seal_envelope(&key, typ_name, &from, &state.roster_msg())?;
         let _ = request(node, peer, addrs, &env)?;
     }
-    let mut applied = 0;
     let mut to_pull: Vec<(NodeId, u64)> = ok.cursors;
     // Also pull the peer's own node if it wasn't in cursors yet.
     if !to_pull.iter().any(|(n, _)| n.0 == peer.to_string()) {
         to_pull.push((NodeId(peer.to_string()), 0));
     }
-    applied += pull_type(state, node, peer, addrs, &key, &to_pull, typ_name, false)?;
-    // Chunks of entries that are still incomplete come along with their type.
+    pull_type(state, node, peer, addrs, &key, &to_pull, typ_name, false, applied)?;
+    // Chunks of entries that are still incomplete come along with their type (not
+    // counted: they complete entries already counted).
     if !is_chunk_type(typ_name) && state.options(typ_name).limits.eager_chunks && !state.log.pending_blobs(typ_name).is_empty() {
-        pull_type(state, node, peer, addrs, &key, &to_pull, &chunk_type(typ_name), true)?;
+        pull_type(state, node, peer, addrs, &key, &to_pull, &chunk_type(typ_name), true, &mut 0)?;
     }
     observe(state, now_ms());
     if state.auto_first_rotation && state.first_rotation_due() {
@@ -341,11 +507,12 @@ pub fn pull_from(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: Pee
         // on a device without a node key): replace it.
         state.rotate(now_ms() as i64)?;
     }
-    Ok(applied)
+    Ok(())
 }
 
-/// Pull `typ_name` of every node in `nodes` under `key`. With `optional`, a server that
-/// does not serve the type (an older peer asked for chunks) ends it quietly.
+/// Pull `typ_name` of every node in `nodes` under `key`, adding new entries to
+/// `applied` page by page. With `optional`, a server that does not serve the type (an
+/// older peer asked for chunks) ends it quietly.
 #[allow(clippy::too_many_arguments)]
 fn pull_type(
     state: &mut SyncState,
@@ -356,9 +523,9 @@ fn pull_type(
     nodes: &[(NodeId, u64)],
     typ_name: &str,
     optional: bool,
-) -> Result<usize> {
+    applied: &mut usize,
+) -> Result<()> {
     let from = node.peer_id().to_string();
-    let mut applied = 0;
     for (nid, _their) in nodes {
         loop {
             // Resume per type: a pull of another type over the same stream must not
@@ -376,7 +543,7 @@ fn pull_type(
                     if last <= after {
                         break;
                     }
-                    applied += state.log.integrate(&p.page);
+                    *applied += state.log.integrate(&p.page);
                     state.log.set_cursor_for(nid, typ_name, last);
                     if last > state.log.cursor(nid) {
                         state.log.set_cursor(nid, last);
@@ -385,15 +552,15 @@ fn pull_type(
                     let env = state.seal_envelope(key, typ_name, &from, &ack)?;
                     let _ = request(node, peer, addrs, &env)?;
                 }
-                Message::Refuse(r) if optional && r.reason == "type-off" => return Ok(applied),
+                Message::Refuse(r) if optional && r.reason == "type-off" => return Ok(()),
                 Message::Refuse(r) => return Err(SyncError::Refused(r.reason)),
                 // Anything else from a peer that does not serve chunks.
-                _ if optional => return Ok(applied),
+                _ if optional => return Ok(()),
                 _ => return Err(SyncError::Protocol("expected Page".into())),
             }
         }
     }
-    Ok(applied)
+    Ok(())
 }
 
 /// Pull the chunks of `typ` (for [`crate::Limits::eager_chunks`] off, or to retry):
@@ -1226,5 +1393,154 @@ mod tests {
             assert_eq!(latest(&r, "secrets", rid).unwrap(), want, "{rid}");
         }
         assert_eq!(read(&r, &versions(&r, "secrets", "k1")[0]).unwrap(), b"one");
+    }
+
+    /// Answers like [`SyncHandler`], but refuses every pull after the first page while `on`.
+    struct RefuseLaterPages {
+        state: Arc<Mutex<SyncState>>,
+        on: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Handler<Vec<u8>, Vec<u8>> for RefuseLaterPages {
+        fn request(&self, from: &PeerId, req: Vec<u8>) -> Vec<u8> {
+            if self.on.load(std::sync::atomic::Ordering::SeqCst)
+                && let Ok(env) = decode::<Envelope>(&req)
+            {
+                let st = self.state.lock().unwrap();
+                if let Ok(Message::Pull(p)) = st.open_envelope(&env, &from.to_string())
+                    && p.after_seq > 0
+                {
+                    return encode(&st.refuse(&from.to_string(), &env.typ, env.epoch, "test-later-page").unwrap()).unwrap();
+                }
+            }
+            SyncHandler { state: self.state.clone() }.request(from, req)
+        }
+    }
+
+    #[test]
+    fn a_refused_later_page_keeps_the_pages_before_it() {
+        let (user, ka, kb, uid) = pair();
+        let (sa, _) = state(&user, &ka, &uid, "a", &["bookmarks"]);
+        let (sb, _) = state(&user, &kb, &uid, "b", &["bookmarks"]);
+        {
+            let ca = sa.lock().unwrap().our_cert.clone();
+            let cb = sb.lock().unwrap().our_cert.clone();
+            sa.lock().unwrap().roster.upsert(cb);
+            sb.lock().unwrap().roster.upsert(ca);
+            let mut a = sa.lock().unwrap();
+            for i in 0..600u64 {
+                a.local_op(1_000 + i, typ::BOOKMARKS, &format!("bm-{i}"), vec![i as u8]);
+            }
+        }
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let na = Node::start(&SYNC_PROFILE, ka, node_config(true), Arc::new(RefuseLaterPages { state: sa.clone(), on: on.clone() })).unwrap();
+        let nb = start_node(kb, node_config(true), sb.clone()).unwrap();
+        let a_node = NodeId(na.peer_id().to_string());
+
+        // Pages are 512 ops: the first is applied and acked, the second refused.
+        let mut copy = sb.lock().unwrap().snapshot();
+        let out = pull_from_outcome(&mut copy, &nb, na.peer_id(), &addrs(&na), typ::BOOKMARKS);
+        assert_eq!(out.applied, 512);
+        assert!(!out.is_ok());
+        assert!(matches!(out.error, Some(SyncError::Refused(ref r)) if r == "test-later-page"), "{:?}", out.error);
+        assert_eq!(copy.log.cursor_for(&a_node, typ::BOOKMARKS), 512);
+        // pull_from keeps its signature: an error, the pages still applied.
+        let mut copy = sb.lock().unwrap().snapshot();
+        assert!(pull_from(&mut copy, &nb, na.peer_id(), &addrs(&na), typ::BOOKMARKS).is_err());
+        assert_eq!(copy.log.iter_node(&a_node).count(), 512);
+        assert!(sb.lock().unwrap().log.iter_node(&a_node).next().is_none(), "snapshots leave the shared state alone");
+
+        // Through the shared state: the partial pull is merged back, then the rest follows.
+        let out = pull_from_shared(&sb, &nb, na.peer_id(), &addrs(&na), typ::BOOKMARKS);
+        assert_eq!((out.applied, out.is_ok()), (512, false));
+        assert_eq!(sb.lock().unwrap().log.iter_node(&a_node).count(), 512);
+        assert_eq!(sb.lock().unwrap().log.cursor_for(&a_node, typ::BOOKMARKS), 512);
+        on.store(false, std::sync::atomic::Ordering::SeqCst);
+        let out = pull_from_shared(&sb, &nb, na.peer_id(), &addrs(&na), typ::BOOKMARKS);
+        assert!(out.is_ok(), "{:?}", out.error);
+        assert_eq!(out.applied, 88);
+        let b = sb.lock().unwrap();
+        assert_eq!(b.log.iter_node(&a_node).count(), 600);
+        assert_eq!(b.log.cursor_for(&a_node, typ::BOOKMARKS), 600);
+        assert!(b.clock.as_ref().is_some_and(|c| c.physical_ms >= 1_599));
+    }
+
+    #[test]
+    fn two_shared_states_pull_from_each_other_at_once() {
+        let user = Keypair::generate_ed25519();
+        let g = linked(&user, &["a", "b"]);
+        let (a, b) = (&g[0], &g[1]);
+        a.0.lock().unwrap().local_op(1, typ::BOOKMARKS, "from-a", vec![1]);
+        b.0.lock().unwrap().local_op(2, typ::BOOKMARKS, "from-b", vec![2]);
+        // Each pull asks the other node, whose handler needs its own state's lock: neither
+        // pull may hold its lock across the network.
+        let (ra, rb) = std::thread::scope(|s| {
+            let ta = s.spawn(|| pull_from_shared(&a.0, &a.1, b.1.peer_id(), &addrs(&b.1), typ::BOOKMARKS));
+            let tb = s.spawn(|| pull_from_shared(&b.0, &b.1, a.1.peer_id(), &addrs(&a.1), typ::BOOKMARKS));
+            (ta.join().unwrap(), tb.join().unwrap())
+        });
+        assert!(ra.is_ok() && rb.is_ok(), "{:?} {:?}", ra.error, rb.error);
+        assert_eq!((ra.applied, rb.applied), (1, 1));
+        assert_eq!(records(a), ["from-a", "from-b"]);
+        assert_eq!(records(b), ["from-a", "from-b"]);
+    }
+
+    #[test]
+    fn merge_back_folds_records_keys_roster_and_clock() {
+        let user = Keypair::generate_ed25519();
+        let g = linked(&user, &["a", "b", "c"]);
+        let (a, b, c) = (&g[0], &g[1], &g[2]);
+        for s in &g {
+            s.0.lock().unwrap().configure("notes", RecordOptions::default()).unwrap();
+        }
+        let data = big(300 * 1024 + 5, 7);
+        {
+            let mut st = a.0.lock().unwrap();
+            st.write(5_000, "notes", "small", b"short").unwrap();
+            st.write(5_001, "notes", "answer", &data).unwrap();
+        }
+        let a_node = NodeId(peer(a));
+
+        // Pull into a snapshot, and rotate there (the first rotation, say).
+        let mut snap = b.0.lock().unwrap().snapshot();
+        assert_eq!(pull_from(&mut snap, &b.1, a.1.peer_id(), &addrs(&a.1), "notes").unwrap(), 2);
+        let head = snap.rotate(6_000).unwrap();
+        let pulled = snap.log.iter_node(&a_node).count();
+        assert!(pulled > 2, "the value came in chunks");
+
+        // Meanwhile the shared state writes and revokes C.
+        {
+            let mut st = b.0.lock().unwrap();
+            st.write(5_500, "notes", "local", b"mine").unwrap();
+            st.roster.revoke(&WEIRDNET, &user, &peer(c), 5_600).unwrap();
+            assert!(st.keys.is_empty());
+        }
+
+        let out = b.0.lock().unwrap().merge_back(&snap);
+        assert_eq!(out.entries, pulled);
+        assert!(out.keys >= 1);
+        assert_eq!(out.revocations, 0);
+        {
+            let st = b.0.lock().unwrap();
+            assert!(!st.roster.get(&peer(c)).unwrap().active(), "the snapshot's active copy never un-revokes");
+            assert!(st.keys.has(&head));
+            assert_eq!(st.roster.chain.root, snap.roster.chain.root);
+            assert_eq!(st.current_key().id, Some(head.clone()));
+            assert_eq!(st.log.cursor_for(&a_node, "notes"), snap.log.cursor_for(&a_node, "notes"));
+            assert_eq!(st.log.cursor(&a_node), snap.log.cursor(&a_node));
+            assert!(st.log.pending_blobs("notes").is_empty());
+            assert!(st.clock.as_ref().unwrap().cmp_total(snap.clock.as_ref().unwrap()).is_ge());
+        }
+        assert_eq!(latest(b, "notes", "small").unwrap(), b"short");
+        assert_eq!(latest(b, "notes", "answer").unwrap(), data);
+        assert_eq!(latest(b, "notes", "local").unwrap(), b"mine");
+        // A local write after the merge orders after everything pulled.
+        let seq = b.0.lock().unwrap().write(1, "notes", "after", b"x").unwrap();
+        let st = b.0.lock().unwrap();
+        let after = st.log.get(&st.our_node, seq).unwrap().hlc.clone();
+        assert!(st.log.iter_node(&a_node).all(|e| after.cmp_total(&e.hlc).is_gt()));
+        drop(st);
+        // Folding the same snapshot again changes nothing.
+        assert_eq!(b.0.lock().unwrap().merge_back(&snap), MergeOutcome::default());
     }
 }

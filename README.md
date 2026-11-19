@@ -67,6 +67,12 @@ A page carries at most `PAGE_BUDGET` bytes of ops (about a quarter of `PAGE_MAX`
 
 A revocation bumps the roster epoch. A hello from an unrevoked device of the same user at an older epoch (or, after a rotation, under any key but the head's) gets the server's roster (user-signed certs and revocations, and the key chain) instead of a refusal; `pull_from` merges it and says hello again. When `pull_from` finds the server behind, it sends the server its roster. A revoked device is refused once a node holds the revocation. With seed-derived keys alone, a revoked device can still derive later keys, so exclusion rests on the session check; a rotation (see Keys) is what shuts it out of the data.
 
+### Shared state, snapshots and partial pulls
+
+A node's `SyncHandler` answers from an `Arc<Mutex<SyncState>>`. Don't hold that lock across a pull: the node stops answering, and two nodes pulling from each other at once wait on each other until the request times out. `pull_from_shared(&state, ..)` takes a `SyncState::snapshot()`, pulls into it without the lock, and folds it back with `SyncState::merge_back` (also after an error). Apps that manage their own copies call `merge_back` themselves; it replaces `take_keys_from`. It merges the roster as on the wire (a revocation on either side wins; nothing is un-revoked), takes epoch keys and the adopted root and opens keys the merged chain seals to this device, integrates log entries it lacks (`OpLog::integrate`, so chunks and blobs are indexed), moves peer and per-type cursors to the further of the two and the clock past both, and returns a `MergeOutcome` (entries, keys, revocations). Write locally to the shared state, not to the snapshot.
+
+A pull applies and acks page by page, so when a later page is refused (or the network drops, or the rotation at the end fails) the earlier pages stay applied. `pull_from` still returns only the error; `pull_from_outcome` and `pull_from_shared` return a `PullOutcome { applied, error }` with the count either way.
+
 ## Merge rules
 
 - Field values are last-writer-wins by HLC.
