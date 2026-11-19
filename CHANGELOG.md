@@ -6,6 +6,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-19
+
 ### Added
 
 - `SyncState` is `Clone`, and `SyncState::snapshot` copies it to pull into without holding a shared lock.
@@ -87,7 +89,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 - HLC, op log, LWW registers, OR-sets, tombstone GC, SyncKey page sealing, roster / self-cert / revocation, and the `weirdnet-sync/v1` protocol over `weirdnet-net` 0.6.0.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.3.0...v0.3.1
