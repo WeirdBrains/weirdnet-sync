@@ -1038,4 +1038,193 @@ mod tests {
         }
     }
 
+    fn pull_t(a: &Sn, b: &Sn, typ: &str) -> Result<usize> {
+        pull_from(&mut a.0.lock().unwrap(), &a.1, b.1.peer_id(), &addrs(&b.1), typ)
+    }
+
+    /// Every entry of `rid` in `typ` that `s` holds, oldest first.
+    fn versions(s: &Sn, typ: &str, rid: &str) -> Vec<crate::LogEntry> {
+        let st = s.0.lock().unwrap();
+        let mut v: Vec<crate::LogEntry> = st
+            .log
+            .cursors()
+            .keys()
+            .flat_map(|n| st.log.iter_node(n).filter(|e| e.typ == typ && e.record_id == rid).cloned().collect::<Vec<_>>())
+            .collect();
+        v.sort_by(|a, b| a.hlc.cmp_total(&b.hlc));
+        v
+    }
+
+    fn read(s: &Sn, e: &crate::LogEntry) -> Result<Vec<u8>> {
+        match s.0.lock().unwrap().read(e)? {
+            crate::RecordValue::Ready(v) => Ok(v.to_vec()),
+            crate::RecordValue::Pending { missing } => Err(SyncError::Protocol(format!("{} chunks missing", missing.len()))),
+        }
+    }
+
+    fn latest(s: &Sn, typ: &str, rid: &str) -> Result<Vec<u8>> {
+        let e = versions(s, typ, rid).pop().ok_or_else(|| SyncError::Protocol(format!("no {rid}")))?;
+        read(s, &e)
+    }
+
+    fn big(len: usize, salt: u8) -> Vec<u8> {
+        (0..len).map(|i| ((i * 131 + salt as usize) % 251) as u8).collect()
+    }
+
+    fn sealed() -> RecordOptions {
+        RecordOptions { sealed: true, ..Default::default() }
+    }
+
+    #[test]
+    fn a_record_larger_than_a_page_syncs_in_chunks() {
+        let user = Keypair::generate_ed25519();
+        let g = linked(&user, &["a", "b", "c"]);
+        let (a, b, c) = (&g[0], &g[1], &g[2]);
+        for s in &g {
+            s.0.lock().unwrap().configure("notes", RecordOptions::default()).unwrap();
+        }
+        let lazy = RecordOptions { limits: crate::Limits { eager_chunks: false, ..Default::default() }, ..Default::default() };
+        c.0.lock().unwrap().configure("notes", lazy).unwrap();
+        let data = big(1024 * 1024 + 17, 1);
+        {
+            let mut st = a.0.lock().unwrap();
+            st.write(1, "notes", "small", b"short").unwrap();
+            st.write_with_fallback(2, "notes", "answer", &data, b"clipped preview".to_vec()).unwrap();
+            assert!(st.log.get(&st.our_node, 1).unwrap().value.is_none(), "a small plain value is a plain op");
+            let chunks = st.log.iter_node(&st.our_node).filter(|e| e.typ == chunk_type("notes")).count();
+            assert_eq!(chunks, data.len().div_ceil(crate::Limits::default().chunk_size));
+            // The same value again reuses this node's chunks.
+            st.write(3, "notes", "copy", &data).unwrap();
+            assert_eq!(st.log.iter_node(&st.our_node).filter(|e| e.typ == chunk_type("notes")).count(), chunks);
+            assert!(matches!(st.write(4, "notes", "huge", &big(17 * 1024 * 1024, 2)), Err(SyncError::Protocol(_))));
+            assert!(st.write(4, &chunk_type("notes"), "x", b"y").is_err());
+        }
+        assert_eq!(pull_t(b, a, "notes").unwrap(), 3);
+        assert_eq!(latest(b, "notes", "small").unwrap(), b"short");
+        assert_eq!(latest(b, "notes", "answer").unwrap(), data);
+        assert_eq!(latest(b, "notes", "copy").unwrap(), data);
+        let e = versions(b, "notes", "answer").pop().unwrap();
+        assert_eq!(e.op, b"clipped preview", "older peers and plain readers see the fallback");
+        assert!(b.0.lock().unwrap().log.pending_blobs("notes").is_empty());
+
+        // C pulls chunks only when asked, and here from B, which relays A's chunks.
+        assert_eq!(pull_t(c, b, "notes").unwrap(), 3);
+        assert!(
+            matches!(c.0.lock().unwrap().read(&e).unwrap(), crate::RecordValue::Pending { ref missing } if missing.len() == data.len().div_ceil(crate::Limits::default().chunk_size))
+        );
+        assert_eq!(
+            pull_chunks(&mut c.0.lock().unwrap(), &c.1, b.1.peer_id(), &addrs(&b.1), "notes").unwrap(),
+            data.len().div_ceil(crate::Limits::default().chunk_size)
+        );
+        assert_eq!(latest(c, "notes", "answer").unwrap(), data);
+    }
+
+    #[test]
+    fn sealed_records_follow_rotation_across_three_devices() {
+        let user = Keypair::generate_ed25519();
+        let uid = user::user_id(&user.public());
+        let g = linked(&user, &["a", "b", "c"]);
+        let (a, b, c) = (&g[0], &g[1], &g[2]);
+        for s in &g {
+            s.0.lock().unwrap().configure("secrets", sealed()).unwrap();
+        }
+        // Seed-derived keys are held by every seed holder: nothing is sealed under them.
+        assert!(matches!(a.0.lock().unwrap().write(1, "secrets", "k1", b"one"), Err(SyncError::Refused(ref r)) if r == "no-epoch-key"));
+        let root = a.0.lock().unwrap().rotate(1).unwrap();
+        let secret = big(150_000, 3);
+        {
+            let mut st = a.0.lock().unwrap();
+            st.write(2, "secrets", "k1", b"one").unwrap();
+            st.write(3, "secrets", "big", &secret).unwrap();
+        }
+        pull_t(b, a, "secrets").unwrap();
+        pull_t(c, a, "secrets").unwrap();
+        for (s, label) in [(a, "a"), (b, "b"), (c, "c")] {
+            assert!(s.0.lock().unwrap().keys.has(&root), "{label}");
+            assert_eq!(latest(s, "secrets", "k1").unwrap(), b"one", "{label}");
+            assert_eq!(latest(s, "secrets", "big").unwrap(), secret, "{label}");
+        }
+        // At rest, the entry holds ciphertext and an empty fallback.
+        let e = versions(b, "secrets", "k1").pop().unwrap();
+        assert!(e.op.is_empty());
+        let v = e.value.clone().unwrap();
+        assert_eq!(v.seal.as_ref().unwrap().key, root);
+        assert!(!v.body.windows(3).any(|w| w == b"one"));
+        // An unsealed entry in a sealed type (a seed holder writing around the seal) is refused.
+        let forged = crate::LogEntry { value: None, op: b"evil".to_vec(), ..e.clone() };
+        assert!(b.0.lock().unwrap().read(&forged).is_err());
+
+        // A revokes C and rotates; new and updated secrets go under the new head.
+        let (second, a_written) = {
+            let mut st = a.0.lock().unwrap();
+            st.revoke(&user, &peer(c), 9).unwrap();
+            let head = st.roster.head_id().unwrap();
+            let from = st.log.cursor(&st.our_node);
+            st.write(10, "secrets", "k2", b"two").unwrap();
+            st.write(11, "secrets", "k1", b"one, changed").unwrap();
+            st.write(12, "secrets", "big2", &big(150_000, 4)).unwrap();
+            (head, from)
+        };
+        assert_ne!(second, root);
+        pull_t(b, a, "secrets").unwrap();
+        assert_eq!(head(b).as_deref(), Some(second.as_str()));
+        assert_eq!(latest(b, "secrets", "k2").unwrap(), b"two");
+        assert_eq!(latest(b, "secrets", "k1").unwrap(), b"one, changed");
+        assert_eq!(latest(b, "secrets", "big2").unwrap(), big(150_000, 4));
+        let k1 = versions(b, "secrets", "k1");
+        assert_eq!(read(b, &k1[0]).unwrap(), b"one", "members keep older epochs readable");
+
+        // C is refused, and even holding A's raw entries (a backup, a relay) it cannot open
+        // anything written after the rotation, though it holds the seed and the root key.
+        assert!(matches!(pull_t(c, a, "secrets"), Err(SyncError::Refused(ref r)) if r == "revoked"));
+        let leaked: Vec<crate::LogEntry> = {
+            let st = a.0.lock().unwrap();
+            st.log.iter_node(&st.our_node).filter(|e| e.seq > a_written).cloned().collect()
+        };
+        {
+            let mut st = c.0.lock().unwrap();
+            let page = crate::LogPage { node_id: NodeId(peer(a)), from_seq: a_written + 1, to_seq: a_written + leaked.len() as u64, ops: leaked };
+            st.log.integrate(&page);
+            assert!(st.keys.has(&root) && !st.keys.has(&second));
+        }
+        for rid in ["k2", "k1", "big2"] {
+            assert!(matches!(latest(c, "secrets", rid), Err(SyncError::Crypto(_))), "c must not read {rid}");
+        }
+        assert_eq!(read(c, &versions(c, "secrets", "k1")[0]).unwrap(), b"one", "what it read before stays what it was");
+
+        // Optional re-seal moves the record still under the root key to the head key.
+        let done = a.0.lock().unwrap().reseal_stale(13, "secrets").unwrap();
+        assert_eq!(done, vec!["big".to_string()]);
+        assert!(a.0.lock().unwrap().reseal_stale(14, "secrets").unwrap().is_empty());
+        pull_t(b, a, "secrets").unwrap();
+        let resealed = versions(b, "secrets", "big").pop().unwrap();
+        assert_eq!(resealed.value.as_ref().unwrap().seal.as_ref().unwrap().key, second);
+        assert_eq!(read(b, &resealed).unwrap(), secret);
+        {
+            let mut st = c.0.lock().unwrap();
+            let a_log = a.0.lock().unwrap();
+            let ops: Vec<crate::LogEntry> = a_log.log.iter_node(&a_log.our_node).cloned().collect();
+            st.log.integrate(&crate::LogPage { node_id: a_log.our_node.clone(), from_seq: 1, to_seq: ops.len() as u64, ops });
+            assert!(st.log.pending_blobs("secrets").is_empty(), "c holds every chunk");
+        }
+        assert!(matches!(read(c, &resealed), Err(SyncError::Crypto(_))));
+
+        // B writes under the head too, and A reads it.
+        b.0.lock().unwrap().write(15, "secrets", "k3", b"three").unwrap();
+        pull_t(a, b, "secrets").unwrap();
+        assert_eq!(latest(a, "secrets", "k3").unwrap(), b"three");
+
+        // A device restored and admitted later reads the secrets of both epochs.
+        let rk = Keypair::generate_ed25519();
+        let (rs, _) = state(&user, &rk, &uid, "restored", &["bookmarks"]);
+        let r = (rs.clone(), start_node(rk, node_config(true), rs).unwrap());
+        r.0.lock().unwrap().configure("secrets", sealed()).unwrap();
+        let cert = r.0.lock().unwrap().our_cert.clone();
+        a.0.lock().unwrap().approve(cert, 16).unwrap();
+        pull_t(&r, a, "secrets").unwrap();
+        for (rid, want) in [("k1", b"one, changed".to_vec()), ("k2", b"two".to_vec()), ("k3", b"three".to_vec()), ("big", secret.clone())] {
+            assert_eq!(latest(&r, "secrets", rid).unwrap(), want, "{rid}");
+        }
+        assert_eq!(read(&r, &versions(&r, "secrets", "k1")[0]).unwrap(), b"one");
+    }
 }
