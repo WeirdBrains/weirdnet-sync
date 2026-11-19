@@ -3971,6 +3971,7 @@ dependencies = [
 name = "weirdnet-sync"
 version = "0.3.1"
 dependencies = [
+ "blake3",
  "cbor4ii",
  "hex",
  "serde",

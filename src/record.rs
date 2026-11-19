@@ -67,7 +67,7 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { inline_max: 64 * 1024, chunk_size: 64 * 1024, record_max: 16 * 1024 * 1024, eager_chunks: true }
+        Self { inline_max: 32 * 1024, chunk_size: 48 * 1024, record_max: 16 * 1024 * 1024, eager_chunks: true }
     }
 }
 
@@ -238,7 +238,9 @@ impl crate::net::SyncState {
 
     /// Like [`crate::SyncState::write`], with the `op` older peers (and apps that
     /// do not call [`crate::SyncState::read`]) see when the value is sealed or chunked,
-    /// for example a clipped preview. A value written plain ignores `fallback`.
+    /// for example a clipped preview. A value written plain ignores `fallback`. The
+    /// fallback itself is never sealed: for a sealed type, leave it empty or make it
+    /// something safe to show.
     pub fn write_with_fallback(&mut self, now_ms: u64, typ: &str, record_id: &str, value: &[u8], fallback: Vec<u8>) -> Result<u64> {
         if is_chunk_type(typ) {
             return Err(SyncError::Protocol("chunk types are written by the crate".into()));
@@ -364,12 +366,10 @@ impl crate::net::SyncState {
     /// The latest entry of every record of `typ` (by HLC).
     pub fn latest_entries(&self, typ: &str) -> Vec<&LogEntry> {
         let mut latest: BTreeMap<&str, &LogEntry> = BTreeMap::new();
-        for n in self.log.cursors().keys() {
-            for e in self.log.iter_node(n).filter(|e| e.typ == typ) {
-                let slot = latest.entry(e.record_id.as_str()).or_insert(e);
-                if e.hlc.cmp_total(&slot.hlc).is_gt() {
-                    *slot = e;
-                }
+        for e in self.log.iter().filter(|e| e.typ == typ) {
+            let slot = latest.entry(e.record_id.as_str()).or_insert(e);
+            if e.hlc.cmp_total(&slot.hlc).is_gt() {
+                *slot = e;
             }
         }
         latest.into_values().collect()
@@ -428,6 +428,7 @@ mod tests {
     fn a_split_value_reassembles_only_from_matching_chunks() {
         let data = big(200_000);
         let (blob, parts) = split(&data, 64 * 1024);
+        assert_eq!(blob.len, 200_000);
         assert_eq!(parts.len(), 4);
         assert_eq!(blob.chunk_ids().len(), 4);
         let ctyp = chunk_type("notes");
@@ -439,7 +440,8 @@ mod tests {
         let forged = entry("x", 1, &ctyp, &hex::encode(h0), vec![0u8; 10], None);
         log.integrate(&Page { node_id: n("x"), from_seq: 1, to_seq: 1, ops: vec![forged] });
         assert!(log.chunk(&ctyp, &h0).is_none());
-        let page: Vec<LogEntry> = parts.iter().enumerate().map(|(i, (h, b))| entry("a", i as u64 + 1, &ctyp, &hex::encode(h), b.to_vec(), None)).collect();
+        let page: Vec<LogEntry> =
+            parts.iter().enumerate().map(|(i, (h, b))| entry("a", i as u64 + 1, &ctyp, &hex::encode(h), b.to_vec(), None)).collect();
         log.integrate(&Page { node_id: n("a"), from_seq: 1, to_seq: 3, ops: page[..3].to_vec() });
         assert_eq!(assemble(&log, "notes", &blob).unwrap(), RecordValue::Pending { missing: vec![hex::encode(parts[3].0)] });
         log.integrate(&Page { node_id: n("a"), from_seq: 4, to_seq: 4, ops: page[3..].to_vec() });

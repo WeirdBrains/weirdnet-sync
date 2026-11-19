@@ -1,8 +1,9 @@
 //! Append-only per-node op log. A device never rewrites another node's entries.
 use crate::hlc::{Hlc, NodeId};
 use crate::protocol::PAGE_BUDGET;
+use crate::record::{Value, is_chunk_type};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// One mutation in some node's log. `op` is the application's encoding; unknown `typ`
 /// values are stored and skipped by the application so a newer device can talk to an older one.
@@ -15,12 +16,16 @@ pub struct LogEntry {
     pub record_id: String,
     #[serde(with = "serde_bytes")]
     pub op: Vec<u8>,
+    /// The full value when `op` is only a fallback (chunked or sealed; see
+    /// [`crate::record`]). Absent before 0.4, and dropped by older peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
 }
 
 impl LogEntry {
     /// Rough encoded size, for page budgeting.
     pub fn wire_size(&self) -> usize {
-        64 + self.typ.len() + self.record_id.len() + self.op.len()
+        64 + self.typ.len() + self.record_id.len() + self.op.len() + self.value.as_ref().map_or(0, Value::wire_size)
     }
 }
 
@@ -47,6 +52,10 @@ pub struct OpLog {
     cursors: HashMap<String, u64>,
     /// Per (node, type): every op of that type with `seq <=` this is applied.
     type_cursors: HashMap<(String, String), u64>,
+    /// Chunk entries by (chunk type, hex hash).
+    chunk_index: HashMap<(String, String), Vec<(String, u64)>>,
+    /// Entries whose value is chunked, by type.
+    blobs: HashMap<String, BTreeSet<(String, u64)>>,
 }
 
 impl OpLog {
@@ -137,11 +146,66 @@ impl OpLog {
     /// Append a local mutation. `seq` is assigned here.
     pub fn append(&mut self, node: NodeId, hlc: Hlc, typ: impl Into<String>, record_id: impl Into<String>, op: Vec<u8>) -> &LogEntry {
         let seq = self.next_seq(&node);
-        let entry = LogEntry { node_id: node.clone(), seq, hlc, typ: typ.into(), record_id: record_id.into(), op };
+        let entry = LogEntry { node_id: node.clone(), seq, hlc, typ: typ.into(), record_id: record_id.into(), op, value: None };
+        self.index(&entry);
         self.entries.insert((node.0.clone(), seq), entry);
         self.next.insert(node.0.clone(), seq + 1);
         self.cursors.insert(node.0.clone(), seq);
         self.entries.get(&(node.0, seq)).expect("just inserted")
+    }
+
+    /// Append a local entry with a [`Value`] (see [`crate::SyncState::write`]).
+    pub fn append_value(
+        &mut self,
+        node: NodeId,
+        hlc: Hlc,
+        typ: impl Into<String>,
+        record_id: impl Into<String>,
+        op: Vec<u8>,
+        value: Value,
+    ) -> &LogEntry {
+        let seq = self.next_seq(&node);
+        let entry = LogEntry { node_id: node.clone(), seq, hlc, typ: typ.into(), record_id: record_id.into(), op, value: Some(value) };
+        self.index(&entry);
+        self.entries.insert((node.0.clone(), seq), entry);
+        self.next.insert(node.0.clone(), seq + 1);
+        self.cursors.insert(node.0.clone(), seq);
+        self.entries.get(&(node.0, seq)).expect("just inserted")
+    }
+
+    fn index(&mut self, e: &LogEntry) {
+        if is_chunk_type(&e.typ) {
+            self.chunk_index.entry((e.typ.clone(), e.record_id.clone())).or_default().push((e.node_id.0.clone(), e.seq));
+        }
+        if e.value.as_ref().is_some_and(|v| v.blob.is_some()) {
+            self.blobs.entry(e.typ.clone()).or_default().insert((e.node_id.0.clone(), e.seq));
+        }
+    }
+
+    /// The bytes of chunk `hash` of chunk type `ctyp`, from any entry whose bytes hash to it.
+    pub fn chunk(&self, ctyp: &str, hash: &[u8]) -> Option<&[u8]> {
+        let at = self.chunk_index.get(&(ctyp.to_string(), hex::encode(hash)))?;
+        at.iter()
+            .filter_map(|(n, s)| self.entries.get(&(n.clone(), *s)))
+            .map(|e| e.op.as_slice())
+            .find(|b| blake3::hash(b).as_bytes()[..] == hash[..])
+    }
+
+    /// Whether `node` already wrote chunk `hash` of `ctyp` (local writes reuse it).
+    pub fn has_own_chunk(&self, node: &NodeId, ctyp: &str, hash: &[u8]) -> bool {
+        self.chunk_index.get(&(ctyp.to_string(), hex::encode(hash))).is_some_and(|at| {
+            at.iter().any(|(n, s)| *n == node.0 && self.entries.get(&(n.clone(), *s)).is_some_and(|e| blake3::hash(&e.op).as_bytes()[..] == hash[..]))
+        })
+    }
+
+    /// Entries of `typ` whose chunked value is not complete yet.
+    pub fn pending_blobs(&self, typ: &str) -> Vec<&LogEntry> {
+        let ctyp = crate::record::chunk_type(typ);
+        let Some(set) = self.blobs.get(typ) else { return Vec::new() };
+        set.iter()
+            .filter_map(|(n, s)| self.entries.get(&(n.clone(), *s)))
+            .filter(|e| e.value.as_ref().and_then(|v| v.blob.as_ref()).is_some_and(|b| b.chunk_hashes().any(|h| self.chunk(&ctyp, h).is_none())))
+            .collect()
     }
 
     pub fn get(&self, node: &NodeId, seq: u64) -> Option<&LogEntry> {
@@ -195,6 +259,7 @@ impl OpLog {
             if self.entries.contains_key(&key) {
                 continue;
             }
+            self.index(e);
             self.entries.insert(key, e.clone());
             added += 1;
             let next = self.next.entry(e.node_id.0.clone()).or_insert(1);
@@ -203,6 +268,11 @@ impl OpLog {
             }
         }
         added
+    }
+
+    /// Every entry held, by node then seq.
+    pub fn iter(&self) -> impl Iterator<Item = &LogEntry> {
+        self.entries.values()
     }
 
     pub fn iter_node(&self, node: &NodeId) -> impl Iterator<Item = &LogEntry> {
@@ -236,7 +306,15 @@ mod tests {
             node_id: n("b"),
             from_seq: 1,
             to_seq: 1,
-            ops: vec![LogEntry { node_id: n("b"), seq: 1, hlc: h(3, "b"), typ: "bookmarks".into(), record_id: "r2".into(), op: b"x".to_vec() }],
+            ops: vec![LogEntry {
+                node_id: n("b"),
+                seq: 1,
+                hlc: h(3, "b"),
+                typ: "bookmarks".into(),
+                record_id: "r2".into(),
+                op: b"x".to_vec(),
+                value: None,
+            }],
         };
         assert_eq!(log.integrate(&remote), 1);
         assert_eq!(log.integrate(&remote), 0);
@@ -269,7 +347,15 @@ mod tests {
     fn a_relayed_stream_is_served_only_as_far_as_it_is_known() {
         let mut log = OpLog::new();
         // We hold a's bookmarks 1 and 3 but not history 2 (never pulled).
-        let e = |seq, typ: &str| LogEntry { node_id: n("a"), seq, hlc: h(seq, "a"), typ: typ.into(), record_id: format!("r{seq}"), op: vec![] };
+        let e = |seq, typ: &str| LogEntry {
+            node_id: n("a"),
+            seq,
+            hlc: h(seq, "a"),
+            typ: typ.into(),
+            record_id: format!("r{seq}"),
+            op: vec![],
+            value: None,
+        };
         log.integrate(&Page { node_id: n("a"), from_seq: 1, to_seq: 3, ops: vec![e(1, "bookmarks"), e(3, "bookmarks")] });
         assert_eq!(log.contiguous(&n("a")), 1);
         assert_eq!(log.cursor_for(&n("a"), "history"), 1, "history 2 is unknown, not absent");

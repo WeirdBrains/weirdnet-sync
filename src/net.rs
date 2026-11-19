@@ -6,8 +6,10 @@ use crate::error::{Result, SyncError};
 use crate::hlc::{Hlc, NodeId};
 use crate::log::OpLog;
 use crate::protocol::{Ack, Envelope, Hello, HelloOk, KeyRef, Message, PAGE_MAX, Pull, Refuse, RosterMsg, SYNC_PROFILE, decode, encode};
+use crate::record::{RecordOptions, base_type, chunk_type, is_chunk_type};
 use crate::roster::{Roster, SessionCheck};
 use crate::rotation::{Device, EpochKeys, KeyChain};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use weirdnet_net::user::NodeCert;
 use weirdnet_net::{Handler, Keypair, Multiaddr, Node, NodeConfig, PeerId, PublicKey, WEIRDNET};
@@ -32,6 +34,8 @@ pub struct SyncState {
     /// [`SyncState::first_rotation_due`]): right after the first link, and once after an
     /// upgrade from seed-only keys. On in [`SyncState::new`].
     pub auto_first_rotation: bool,
+    /// Per-type write options (sealed, size limits); see [`SyncState::configure`].
+    pub records: BTreeMap<String, RecordOptions>,
 }
 
 impl SyncState {
@@ -54,6 +58,7 @@ impl SyncState {
             device,
             keys: EpochKeys::new(),
             auto_first_rotation: true,
+            records: BTreeMap::new(),
         };
         if st.device.is_some() {
             st.publish_device_key(st.our_cert.issued_at)?;
@@ -191,7 +196,9 @@ impl SyncState {
     }
 
     fn on_pull(&self, p: Pull) -> Message {
-        if !self.types.iter().any(|t| t == &p.typ) {
+        // A type's chunks are served wherever the type is.
+        let served = base_type(&p.typ).unwrap_or(&p.typ);
+        if !self.types.iter().any(|t| t == served) {
             return Message::Refuse(Refuse::new("type-off"));
         }
         let limit = (p.limit as usize).clamp(1, 4096);
@@ -200,11 +207,17 @@ impl SyncState {
         Message::Page(crate::protocol::Page { typ: p.typ, page })
     }
 
-    /// A local write: tick the clock, append one log op.
-    pub fn local_op(&mut self, now_ms: u64, typ: &str, record_id: &str, op: Vec<u8>) {
+    /// A local write: tick the clock, append one log op. Returns its seq. For values
+    /// that may be large or that are sealed, use [`SyncState::write`].
+    pub fn local_op(&mut self, now_ms: u64, typ: &str, record_id: &str, op: Vec<u8>) -> u64 {
+        let hlc = self.tick(now_ms);
+        self.log.append(self.our_node.clone(), hlc, typ, record_id, op).seq
+    }
+
+    pub(crate) fn tick(&mut self, now_ms: u64) -> Hlc {
         let hlc = Hlc::tick(self.clock.as_ref(), now_ms, self.our_node.clone());
         self.clock = Some(hlc.clone());
-        self.log.append(self.our_node.clone(), hlc, typ, record_id, op);
+        hlc
     }
 }
 
@@ -313,36 +326,10 @@ pub fn pull_from(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: Pee
     if !to_pull.iter().any(|(n, _)| n.0 == peer.to_string()) {
         to_pull.push((NodeId(peer.to_string()), 0));
     }
-    for (nid, _their) in to_pull {
-        loop {
-            // Resume per type: a pull of another type over the same stream must not
-            // move this type's position.
-            let after = state.log.cursor_for(&nid, typ_name);
-            let pull = Message::Pull(Pull { node_id: nid.clone(), after_seq: after, typ: typ_name.into(), limit: 512 });
-            let env = state.seal_envelope(&key, typ_name, &from, &pull)?;
-            let reply = request(node, peer, addrs, &env)?;
-            match state.open_envelope(&reply, &from)? {
-                Message::Page(p) => {
-                    let last = p.page.to_seq;
-                    if p.typ != typ_name || p.page.node_id != nid || p.page.ops.iter().any(|e| e.typ != typ_name) {
-                        return Err(SyncError::Protocol("page of another type or node".into()));
-                    }
-                    if last <= after {
-                        break;
-                    }
-                    applied += state.log.integrate(&p.page);
-                    state.log.set_cursor_for(&nid, typ_name, last);
-                    if last > state.log.cursor(&nid) {
-                        state.log.set_cursor(&nid, last);
-                    }
-                    let ack = Message::Ack(Ack { node_id: nid.clone(), last_seq: last });
-                    let env = state.seal_envelope(&key, typ_name, &from, &ack)?;
-                    let _ = request(node, peer, addrs, &env)?;
-                }
-                Message::Refuse(r) => return Err(SyncError::Refused(r.reason)),
-                _ => return Err(SyncError::Protocol("expected Page".into())),
-            }
-        }
+    applied += pull_type(state, node, peer, addrs, &key, &to_pull, typ_name, false)?;
+    // Chunks of entries that are still incomplete come along with their type.
+    if !is_chunk_type(typ_name) && state.options(typ_name).limits.eager_chunks && !state.log.pending_blobs(typ_name).is_empty() {
+        pull_type(state, node, peer, addrs, &key, &to_pull, &chunk_type(typ_name), true)?;
     }
     observe(state, now_ms());
     if state.auto_first_rotation && state.first_rotation_due() {
@@ -355,6 +342,64 @@ pub fn pull_from(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: Pee
         state.rotate(now_ms() as i64)?;
     }
     Ok(applied)
+}
+
+/// Pull `typ_name` of every node in `nodes` under `key`. With `optional`, a server that
+/// does not serve the type (an older peer asked for chunks) ends it quietly.
+#[allow(clippy::too_many_arguments)]
+fn pull_type(
+    state: &mut SyncState,
+    node: &Node<Vec<u8>, Vec<u8>>,
+    peer: PeerId,
+    addrs: &[Multiaddr],
+    key: &KeyRef,
+    nodes: &[(NodeId, u64)],
+    typ_name: &str,
+    optional: bool,
+) -> Result<usize> {
+    let from = node.peer_id().to_string();
+    let mut applied = 0;
+    for (nid, _their) in nodes {
+        loop {
+            // Resume per type: a pull of another type over the same stream must not
+            // move this type's position.
+            let after = state.log.cursor_for(nid, typ_name);
+            let pull = Message::Pull(Pull { node_id: nid.clone(), after_seq: after, typ: typ_name.into(), limit: 512 });
+            let env = state.seal_envelope(key, typ_name, &from, &pull)?;
+            let reply = request(node, peer, addrs, &env)?;
+            match state.open_envelope(&reply, &from)? {
+                Message::Page(p) => {
+                    let last = p.page.to_seq;
+                    if p.typ != typ_name || p.page.node_id != *nid || p.page.ops.iter().any(|e| e.typ != typ_name) {
+                        return Err(SyncError::Protocol("page of another type or node".into()));
+                    }
+                    if last <= after {
+                        break;
+                    }
+                    applied += state.log.integrate(&p.page);
+                    state.log.set_cursor_for(nid, typ_name, last);
+                    if last > state.log.cursor(nid) {
+                        state.log.set_cursor(nid, last);
+                    }
+                    let ack = Message::Ack(Ack { node_id: nid.clone(), last_seq: last });
+                    let env = state.seal_envelope(key, typ_name, &from, &ack)?;
+                    let _ = request(node, peer, addrs, &env)?;
+                }
+                Message::Refuse(r) if optional && r.reason == "type-off" => return Ok(applied),
+                Message::Refuse(r) => return Err(SyncError::Refused(r.reason)),
+                // Anything else from a peer that does not serve chunks.
+                _ if optional => return Ok(applied),
+                _ => return Err(SyncError::Protocol("expected Page".into())),
+            }
+        }
+    }
+    Ok(applied)
+}
+
+/// Pull the chunks of `typ` (for [`crate::Limits::eager_chunks`] off, or to retry):
+/// the same session as [`pull_from`], for the companion type [`chunk_type`]`(typ)`.
+pub fn pull_chunks(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: PeerId, addrs: &[Multiaddr], typ: &str) -> Result<usize> {
+    pull_from(state, node, peer, addrs, &chunk_type(typ))
 }
 
 /// Advance our clock past the newest op held, so the next local write orders after
@@ -418,6 +463,7 @@ mod tests {
             device: Some(Device::from_node_key(node_key).unwrap()),
             keys: EpochKeys::new(),
             auto_first_rotation: false,
+            records: BTreeMap::new(),
         };
         let mut st = st;
         st.publish_device_key(1).unwrap();
@@ -991,4 +1037,5 @@ mod tests {
             assert!(matches!(st.key_status(), KeyStatus::Current { .. }));
         }
     }
+
 }
