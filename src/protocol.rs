@@ -20,9 +20,11 @@ pub const PROTOCOL: &str = "/weirdnet/sync/1";
 /// Largest sealed page (and the reply cap to set on a sync node). Still under weirdnet-net's 8 MiB default.
 pub const PAGE_MAX: usize = 256 * 1024;
 
-/// Plaintext budget for the ops in one page. The sealed body travels hex-encoded, so an
-/// envelope is a little over twice its plaintext; this keeps a full page under [`PAGE_MAX`].
-pub const PAGE_BUDGET: usize = (PAGE_MAX - 8 * 1024) / 2;
+/// Plaintext budget for the ops in one page. The sealed body is hex in the envelope, and
+/// weirdnet-net's request-response CBOR sends the envelope bytes as an array of integers
+/// (two bytes each for hex digits), so a page is about four times its plaintext on the
+/// wire. This keeps a full page under [`PAGE_MAX`], which is also what a 0.3 puller accepts.
+pub const PAGE_BUDGET: usize = (PAGE_MAX - 16 * 1024) / 4;
 
 /// Identifier profile: `/weirdnet/sync/1` for request-response, otherwise [`WEIRDNET`].
 pub static SYNC_PROFILE: Profile = Profile { protocol: PROTOCOL, thread: "weirdnet-sync", ..WEIRDNET };
@@ -249,11 +251,13 @@ mod tests {
         assert!(page.ops.len() > 10 && page.to_seq < 400, "the budget split the stream");
         let msg = Message::Page(Page { typ: "bookmarks".into(), page });
         let env = Envelope::seal(&SEED, &uid, "bookmarks", 0, "peer-b", &msg).unwrap();
-        let wire = encode(&env).unwrap().len();
-        assert!(wire <= PAGE_MAX, "sealed page is {wire} bytes, cap {PAGE_MAX}");
+        // What the request-response codec sends: the envelope bytes as a CBOR value.
+        let wire = |env: &Envelope| encode(&encode(env).unwrap()).unwrap().len();
+        assert!(wire(&env) <= PAGE_MAX, "sealed page is {} bytes on the wire, cap {PAGE_MAX}", wire(&env));
+        assert!(wire(&env) > PAGE_MAX / 2, "the budget is not far too small");
         let page = log.page(&node, 0, 4096);
         let env = Envelope::seal(&SEED, &uid, "bookmarks", 0, "peer-b", &Message::Page(Page { typ: "bookmarks".into(), page })).unwrap();
-        assert!(encode(&env).unwrap().len() <= PAGE_MAX);
+        assert!(wire(&env) <= PAGE_MAX);
     }
 
     #[test]
