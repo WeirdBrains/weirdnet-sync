@@ -6,6 +6,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-18
+
 ### Added
 
 - Large records: `SyncState::write` splits a value over `Limits::inline_max` into BLAKE3 content-addressed chunks, stored as entries of the companion type `<typ>#chunks` and pulled right after their type (`Limits::eager_chunks`) or on demand (`pull_chunks`). `SyncState::read` reassembles a value only when every chunk, the length and the whole hash match, and reports `RecordValue::Pending` with the missing chunks otherwise. A type's chunks are served wherever the type is.
@@ -63,7 +65,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 - HLC, op log, LWW registers, OR-sets, tombstone GC, SyncKey page sealing, roster / self-cert / revocation, and the `weirdnet-sync/v1` protocol over `weirdnet-net` 0.6.0.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.1.0...v0.2.0
