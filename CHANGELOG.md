@@ -15,6 +15,7 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ### Changed
 
+- Breaking: depends on weirdnet-net 0.7 (its `NodeCert`, `NodeConfig`, `Keypair` and `Profile` are in this crate's API, so apps move to weirdnet-net 0.7 with it). The sync profile is unchanged: it never made links.
 - `LogEntry` has an optional `value` (the full value when `op` is only a fallback). It is omitted when empty, so plain entries keep the 0.3 wire shape, and older peers skip it and keep the fallback. A `Value` newer than this crate reads is refused rather than misread.
 - `SyncState` has a `records` field; `SyncState::local_op` returns the new seq.
 
