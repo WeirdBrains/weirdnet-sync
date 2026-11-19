@@ -6,6 +6,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-19
+
 ### Changed
 
 - Breaking: depends on weirdnet-net 0.8 (its types are in this crate's API, so apps move to 0.8 with it). Requests and replies now carry byte fields as CBOR byte strings, so the sync request-response protocol id is `/weirdnet/sync/2` (was `/1`) and a 0.4 node and a 0.5 node fail to negotiate rather than fail to decode. Upgrade every device together.
@@ -74,7 +76,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 - HLC, op log, LWW registers, OR-sets, tombstone GC, SyncKey page sealing, roster / self-cert / revocation, and the `weirdnet-sync/v1` protocol over `weirdnet-net` 0.6.0.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.2.0...v0.3.0
