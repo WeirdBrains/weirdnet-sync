@@ -6,6 +6,21 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Large records: `SyncState::write` splits a value over `Limits::inline_max` into BLAKE3 content-addressed chunks, stored as entries of the companion type `<typ>#chunks` and pulled right after their type (`Limits::eager_chunks`) or on demand (`pull_chunks`). `SyncState::read` reassembles a value only when every chunk, the length and the whole hash match, and reports `RecordValue::Pending` with the missing chunks otherwise. A type's chunks are served wherever the type is.
+- Sealed records: a type configured with `RecordOptions { sealed: true, .. }` has every value sealed under a per-record key derived from the head epoch key (`record::record_key`; associated data binds type, record id, epoch, rotation and writer). A device revoked before a write cannot open it, even with the seed and every older key. Members keep older epoch keys and admitted devices receive them, so values sealed before a rotation stay readable; `SyncState::reseal_stale` optionally re-seals them under the head key. Nothing is sealed under seed-derived keys (`no-epoch-key`), and an unsealed entry in a sealed type is refused.
+- `SyncState::configure`, `options`, `write`, `write_with_fallback`, `read`, `latest_entries`, `reseal_stale`; `record::{Limits, RecordOptions, Value, Blob, SealInfo, RecordRef, RecordValue}`, `chunk_type`, `seal_record` / `open_record`; `OpLog::append_value`, `chunk`, `pending_blobs`, `iter`; `PAGE_BUDGET`.
+
+### Changed
+
+- `LogEntry` has an optional `value` (the full value when `op` is only a fallback). It is omitted when empty, so plain entries keep the 0.3 wire shape, and older peers skip it and keep the fallback. A `Value` newer than this crate reads is refused rather than misread.
+- `SyncState` has a `records` field; `SyncState::local_op` returns the new seq.
+
+### Fixed
+
+- Pages are budgeted for what crosses the wire (`PAGE_BUDGET`, about a quarter of `PAGE_MAX`: the sealed body is hex, and the request-response codec sends bytes as an integer array), so a full page no longer exceeds the 256 KiB reply cap and stalls the stream.
+
 ## [0.3.1] - 2026-11-18
 
 ### Fixed

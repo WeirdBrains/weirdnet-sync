@@ -28,13 +28,42 @@ This is not [`Profile::sync_key`](https://docs.rs/weirdnet-net): that derives on
 
 The official WeirdBrains relay must not store sealed pages. Only a user-run node may keep them for catch-up, and that is an application choice, not something this crate enables on a relay.
 
+## Large and sealed records
+
+An entry's `op` is what every version reads. Since 0.4 an entry may also carry a `value` (`record::Value`); then `op` is only a fallback (empty, or a preview the application passes to `SyncState::write_with_fallback`) and the full value is in `value`. Older peers skip the field and keep the fallback. A peer before 0.4 that relays an entry keeps only the fallback, so a device that gets the entry through it sees the fallback too, not a corrupted value.
+
+Configure a type once on every device, then write and read whole values:
+
+```rust
+state.configure("chat", RecordOptions::default())?;                        // chunk values over 32 KiB
+state.configure("secrets", RecordOptions { sealed: true, ..Default::default() })?;
+state.write(now_ms, "chat", "answer-1", &long_answer)?;
+match state.read(&entry)? {
+    RecordValue::Ready(bytes) => { /* apply */ }
+    RecordValue::Pending { missing } => { /* pull_chunks(...) and read again */ }
+}
+```
+
+### Chunks
+
+A value larger than `Limits::inline_max` (after sealing) is split into `Limits::chunk_size` chunks, each an entry of the companion type `<typ>#chunks` whose record id is the BLAKE3 hash of its bytes. The entry of `<typ>` carries the manifest (`Blob`: length, whole hash, chunk hashes). A node reuses chunks it already wrote. `pull_from` pulls a type's chunks right after the type when an entry is still incomplete (`Limits::eager_chunks`, on by default); with it off, call `pull_chunks` when the value is needed. `SyncState::read` reassembles only when every chunk, the length and the whole hash match. A server serves a type's chunks wherever it serves the type; a 0.3 server refuses them and the pull carries on. Defaults: 32 KiB inline, 48 KiB chunks, 16 MiB per record; `Limits::check` keeps them inside a page.
+
+### Sealed records
+
+`RecordOptions::sealed` seals every value of the type under a key for that record: `HKDF-SHA256(epoch key, salt = user id, info = weirdnet-sync/v1/record/<type>/e<n>/k<rotation id>/<record id>)`, XChaCha20-Poly1305 with associated data binding the type, record id, epoch, rotation and writer node. Sealing happens before chunking, so chunks of a sealed value are ciphertext. The value stays sealed at rest in every log, not only on the wire.
+
+- Only the head epoch key seals. Seed-derived keys are held by every seed holder, revoked or not, so a write before the first rotation fails with `no-epoch-key`.
+- A device revoked before a write is not a member of the head rotation and cannot open the value, even holding the seed, every older key and the raw entries.
+- Members keep older epoch keys and admitted devices receive them, so values sealed before a rotation stay readable. `SyncState::reseal_stale` re-seals the latest value of each record still under an older key; it is optional and is a new write of the same value, so run it after syncing. A revoked device keeps whatever it could read before; change the secret itself when that matters.
+- `read` refuses an unsealed entry in a sealed type, so a seed holder cannot write around the seal. The fallback is never sealed.
+
 ## Protocol
 
 `/weirdnet/sync/1`, length-prefixed CBOR, one request/reply at a time (the same style as `/weirdnet/link/1`). After the authenticated channel is up, payloads that carry records, cursors or certificates are sealed. Messages: `Hello` / `HelloOk` or `Refuse`, `Pull`, `Page`, `Ack`, `Roster`.
 
 A session is accepted only if the peer presents a `NodeCert` for the same user that `WEIRDNET.verify_cert` accepts and that is not revoked.
 
-A node's log can mix record types. `Pull` asks for one type; pull positions are kept per (node, type) (`OpLog::cursor_for`), so pulling one type never skips another type's ops. `Page.to_seq` is the last seq the server walked, which may be past the last op it returned. A server answers only up to what it holds completely for that type: its own contiguous prefix of the node's log, or how far it has pulled that type itself. After a pull, `pull_from` moves the node's clock past the newest op it holds, so a later local write orders after everything it has seen. An `Ack` reports the puller's progress and never moves the server's own cursors.
+A page carries at most `PAGE_BUDGET` bytes of ops (about a quarter of `PAGE_MAX`, because the sealed body is hex and the request-response codec sends bytes as an integer array), so it fits a 256 KiB reply cap on the wire. A node's log can mix record types. `Pull` asks for one type; pull positions are kept per (node, type) (`OpLog::cursor_for`), so pulling one type never skips another type's ops. `Page.to_seq` is the last seq the server walked, which may be past the last op it returned. A server answers only up to what it holds completely for that type: its own contiguous prefix of the node's log, or how far it has pulled that type itself. After a pull, `pull_from` moves the node's clock past the newest op it holds, so a later local write orders after everything it has seen. An `Ack` reports the puller's progress and never moves the server's own cursors.
 
 A revocation bumps the roster epoch. A hello from an unrevoked device of the same user at an older epoch (or, after a rotation, under any key but the head's) gets the server's roster (user-signed certs and revocations, and the key chain) instead of a refusal; `pull_from` merges it and says hello again. When `pull_from` finds the server behind, it sends the server its roster. A revoked device is refused once a node holds the revocation. With seed-derived keys alone, a revoked device can still derive later keys, so exclusion rests on the session check; a rotation (see Keys) is what shuts it out of the data.
 
