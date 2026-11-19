@@ -28,6 +28,6 @@ pub use protocol::{
     SYNC_PROFILE, decode, decode_framed, encode, encode_framed,
 };
 pub use record::{Blob, Limits, RecordOptions, RecordRef, RecordValue, SealInfo, Value, chunk_type};
-pub use roster::{Roster, SessionCheck, SessionOffer};
+pub use roster::{CallerCheck, Roster, SessionCheck, SessionOffer};
 pub use rotation::{Admission, ChainView, Device, DeviceKey, EpochKeys, KeyChain, KeyStatus, Rotation, SealedKey, ValidRotation};
 pub use seal::{SyncKey, SyncType, open_page, page_aad, page_aad_keyed, rotated_sync_key, seal_page, sync_key, sync_key_info};

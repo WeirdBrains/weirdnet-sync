@@ -147,6 +147,65 @@ impl Roster {
     }
 }
 
+/// What [`Roster::check_caller`] decided about a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerCheck {
+    /// An active, verified device of this user, in the key chain's head once there is one.
+    Linked,
+    /// No cert for this peer in the roster. A cert the caller presents is not enough: anyone
+    /// holding the seed (a revoked device too) can mint one.
+    Unknown,
+    /// Revoked here, or the caller presented a revoked cert.
+    Revoked,
+    /// The cert is for another user or another peer, or does not verify.
+    WrongUser,
+    /// In the roster but not a member of the current key chain's head (not yet admitted).
+    NotAdmitted,
+}
+
+impl CallerCheck {
+    /// The refusal reason to send back, `None` for [`CallerCheck::Linked`].
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            CallerCheck::Linked => None,
+            CallerCheck::Unknown => Some("unknown-device"),
+            CallerCheck::Revoked => Some("revoked"),
+            CallerCheck::WrongUser => Some("wrong-user"),
+            CallerCheck::NotAdmitted => Some("needs-admission"),
+        }
+    }
+}
+
+impl Roster {
+    /// Whether the caller of an app call or stream served by this device is one of the
+    /// user's linked devices. `peer` must be the transport-authenticated peer id (Noise),
+    /// never one the caller sent. `presented` is the cert the caller sent with the call, if
+    /// any; it must match `peer` and the user, and a revoked one is refused, but only this
+    /// roster's own cert admits a caller.
+    pub fn check_caller(&self, profile: &Profile, user_key: &PublicKey, peer: &str, presented: Option<&NodeCert>) -> CallerCheck {
+        let uid = user::user_id(user_key);
+        if let Some(p) = presented {
+            if p.peer_id != peer || p.user_id != uid || !profile.verify_cert(user_key, p) {
+                return CallerCheck::WrongUser;
+            }
+            if !p.active() {
+                return CallerCheck::Revoked;
+            }
+        }
+        let Some(cert) = self.get(peer) else { return CallerCheck::Unknown };
+        if !cert.active() {
+            return CallerCheck::Revoked;
+        }
+        if cert.user_id != uid || !profile.verify_cert(user_key, cert) {
+            return CallerCheck::WrongUser;
+        }
+        if self.chain_view().head().is_some_and(|h| !h.members.contains(peer)) {
+            return CallerCheck::NotAdmitted;
+        }
+        CallerCheck::Linked
+    }
+}
+
 /// Default profile used for certs unless the application passes another.
 pub fn default_profile() -> &'static Profile {
     &WEIRDNET
@@ -225,6 +284,37 @@ mod tests {
             ),
             SessionCheck::WrongUser
         );
+    }
+
+    #[test]
+    fn callers_are_checked_against_the_roster() {
+        let u = user();
+        let mut r = Roster::new();
+        r.upsert(Roster::self_certify(&WEIRDNET, &u, "peer-a", "desktop", 1).unwrap());
+        r.upsert(Roster::self_certify(&WEIRDNET, &u, "peer-b", "phone", 2).unwrap());
+        let a = r.get("peer-a").unwrap().clone();
+        let check = |r: &Roster, peer: &str, presented: Option<&NodeCert>| r.check_caller(&WEIRDNET, &u.public(), peer, presented);
+        assert_eq!(check(&r, "peer-a", None), CallerCheck::Linked);
+        assert_eq!(check(&r, "peer-a", Some(&a)), CallerCheck::Linked);
+        assert_eq!(check(&r, "peer-b", Some(&a)), CallerCheck::WrongUser, "a cert for another peer");
+        // A cert minted with the user key for a peer this roster never had.
+        let minted = Roster::self_certify(&WEIRDNET, &u, "peer-m", "minted", 3).unwrap();
+        assert_eq!(check(&r, "peer-m", Some(&minted)), CallerCheck::Unknown);
+        assert_eq!(check(&r, "peer-x", None), CallerCheck::Unknown);
+        // Another user's device.
+        let other = user();
+        let foreign = Roster::self_certify(&WEIRDNET, &other, "peer-a", "x", 1).unwrap();
+        assert_eq!(check(&r, "peer-a", Some(&foreign)), CallerCheck::WrongUser);
+        let mut theirs = Roster::new();
+        theirs.upsert(foreign);
+        assert_eq!(check(&theirs, "peer-a", None), CallerCheck::WrongUser);
+        // Revoked here, and a revoked cert presented to a roster that has not heard.
+        let stale = r.clone();
+        let revoked = r.revoke(&WEIRDNET, &u, "peer-b", 4).unwrap();
+        assert_eq!(check(&r, "peer-b", None), CallerCheck::Revoked);
+        assert_eq!(check(&stale, "peer-b", Some(&revoked)), CallerCheck::Revoked);
+        assert_eq!(CallerCheck::Revoked.reason(), Some("revoked"));
+        assert_eq!(CallerCheck::Linked.reason(), None);
     }
 
     #[test]
