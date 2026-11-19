@@ -1,6 +1,6 @@
 //! Append-only per-node op log. A device never rewrites another node's entries.
 use crate::hlc::{Hlc, NodeId};
-use crate::protocol::PAGE_MAX;
+use crate::protocol::PAGE_BUDGET;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -15,6 +15,13 @@ pub struct LogEntry {
     pub record_id: String,
     #[serde(with = "serde_bytes")]
     pub op: Vec<u8>,
+}
+
+impl LogEntry {
+    /// Rough encoded size, for page budgeting.
+    pub fn wire_size(&self) -> usize {
+        64 + self.typ.len() + self.record_id.len() + self.op.len()
+    }
 }
 
 mod serde_bytes {
@@ -98,7 +105,7 @@ impl OpLog {
     }
 
     /// Ops of `typ` from `node` with `after_seq < seq <= known_to`, up to `limit` ops and
-    /// [`PAGE_MAX`] bytes. Missing seqs in that range are other types and are skipped, so
+    /// [`PAGE_BUDGET`] bytes. Missing seqs in that range are other types and are skipped, so
     /// `known_to` must be [`OpLog::cursor_for`] (or less). `to_seq` is the last seq walked,
     /// which may be past the last op returned; a puller resumes after it.
     pub fn page_of_type(&self, node: &NodeId, typ: &str, after_seq: u64, known_to: u64, limit: usize) -> Page {
@@ -109,8 +116,8 @@ impl OpLog {
             let mut full = false;
             for (_, e) in self.entries.range((node.0.clone(), after_seq + 1)..=(node.0.clone(), known_to)) {
                 if e.typ == typ {
-                    let add = 64 + e.typ.len() + e.record_id.len() + e.op.len();
-                    if !ops.is_empty() && (ops.len() >= limit || bytes + add > PAGE_MAX) {
+                    let add = e.wire_size();
+                    if !ops.is_empty() && (ops.len() >= limit || bytes + add > PAGE_BUDGET) {
                         full = true;
                         break;
                     }
@@ -149,17 +156,17 @@ impl OpLog {
         self.entries.is_empty()
     }
 
-    /// Entries of `node` with `seq > after_seq`, up to `limit` and [`PAGE_MAX`] encoded bytes.
+    /// Entries of `node` with `seq > after_seq`, up to `limit` and [`PAGE_BUDGET`] plaintext bytes.
     pub fn page(&self, node: &NodeId, after_seq: u64, limit: usize) -> Page {
         let mut ops = Vec::new();
         let mut bytes = 0usize;
         for seq in (after_seq + 1).. {
             let Some(e) = self.entries.get(&(node.0.clone(), seq)) else { break };
-            let add = 64 + e.typ.len() + e.record_id.len() + e.op.len();
-            if !ops.is_empty() && (ops.len() >= limit || bytes + add > PAGE_MAX) {
+            let add = e.wire_size();
+            if !ops.is_empty() && (ops.len() >= limit || bytes + add > PAGE_BUDGET) {
                 break;
             }
-            if add > PAGE_MAX && ops.is_empty() {
+            if add > PAGE_BUDGET && ops.is_empty() {
                 // A single oversized op still goes out: the app must not write one this large,
                 // but dropping it would stall the cursor.
                 ops.push(e.clone());

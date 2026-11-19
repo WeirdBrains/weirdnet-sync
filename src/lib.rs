@@ -23,8 +23,8 @@ pub use log::{LogEntry, OpLog, Page as LogPage};
 pub use merge::{CONFLICT_KEEP_MS, Lww, OrSet, TOMBSTONE_GC_MS, can_gc_tombstone, edit_vs_delete, folder_cycle, lww};
 pub use net::{SyncHandler, SyncState, node_config, pull_from, start_node};
 pub use protocol::{
-    Ack, Cursors, Envelope, Hello, HelloOk, KeyRef, Message, PAGE_MAX, PROTOCOL, Page, Pull, Refuse, RefuseReason, RosterMsg, SYNC_PROFILE, decode,
-    decode_framed, encode, encode_framed,
+    Ack, Cursors, Envelope, Hello, HelloOk, KeyRef, Message, PAGE_BUDGET, PAGE_MAX, PROTOCOL, Page, Pull, Refuse, RefuseReason, RosterMsg,
+    SYNC_PROFILE, decode, decode_framed, encode, encode_framed,
 };
 pub use roster::{Roster, SessionCheck, SessionOffer};
 pub use rotation::{Admission, ChainView, Device, DeviceKey, EpochKeys, KeyChain, KeyStatus, Rotation, SealedKey, ValidRotation};
