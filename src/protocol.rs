@@ -14,19 +14,24 @@ use weirdnet_net::profile::{Profile, WEIRDNET};
 use weirdnet_net::user::NodeCert;
 use zeroize::Zeroizing;
 
-/// Request-response protocol id, same style as `/weirdnet/link/1`.
-pub const PROTOCOL: &str = "/weirdnet/sync/1";
+/// Request-response protocol id. `/2` since weirdnet-net 0.8 sends byte fields as CBOR byte
+/// strings; a 0.4 (`/1`) node fails to negotiate instead of failing to decode.
+pub const PROTOCOL: &str = "/weirdnet/sync/2";
 
-/// Largest sealed page (and the reply cap to set on a sync node). Still under weirdnet-net's 8 MiB default.
+/// Largest sealed page on the wire (and the request and reply cap to set on a sync node).
 pub const PAGE_MAX: usize = 256 * 1024;
 
-/// Plaintext budget for the ops in one page. The sealed body is hex in the envelope, and
-/// weirdnet-net's request-response CBOR sends the envelope bytes as an array of integers
-/// (two bytes each for hex digits), so a page is about four times its plaintext on the
-/// wire. This keeps a full page under [`PAGE_MAX`], which is also what a 0.3 puller accepts.
-pub const PAGE_BUDGET: usize = (PAGE_MAX - 16 * 1024) / 4;
+/// Plaintext budget for the ops in one page. The sealed body is hex in the envelope (two
+/// bytes per plaintext byte), and weirdnet-net 0.8 sends the encoded envelope as one CBOR
+/// byte string (one byte per byte, a few bytes of header). So a page is about twice its
+/// plaintext on the wire, plus the envelope fields. This reserves 16 KiB for those and for
+/// the gap between [`LogEntry::wire_size`](crate::log::LogEntry::wire_size) and the real
+/// encoding (which is an estimate), then halves the rest: a full page is about 120 KiB
+/// plus slack under [`PAGE_MAX`]. (Through 0.4 this was a quarter, because 0.7 sent the
+/// bytes as integer arrays.)
+pub const PAGE_BUDGET: usize = (PAGE_MAX - 16 * 1024) / 2 - 8 * 1024;
 
-/// Identifier profile: `/weirdnet/sync/1` for request-response, otherwise [`WEIRDNET`].
+/// Identifier profile: `/weirdnet/sync/2` for request-response, otherwise [`WEIRDNET`].
 pub static SYNC_PROFILE: Profile = Profile { protocol: PROTOCOL, thread: "weirdnet-sync", ..WEIRDNET };
 
 /// Last seq applied from each node, as sent in Hello.
@@ -251,10 +256,11 @@ mod tests {
         assert!(page.ops.len() > 10 && page.to_seq < 400, "the budget split the stream");
         let msg = Message::Page(Page { typ: "bookmarks".into(), page });
         let env = Envelope::seal(&SEED, &uid, "bookmarks", 0, "peer-b", &msg).unwrap();
-        // What the request-response codec sends: the envelope bytes as a CBOR value.
-        let wire = |env: &Envelope| encode(&encode(env).unwrap()).unwrap().len();
+        // What weirdnet-net 0.8 sends: the envelope bytes as one CBOR byte string.
+        let wire = |env: &Envelope| weirdnet_net::wire::to_vec(&encode(env).unwrap()).unwrap().len();
         assert!(wire(&env) <= PAGE_MAX, "sealed page is {} bytes on the wire, cap {PAGE_MAX}", wire(&env));
-        assert!(wire(&env) > PAGE_MAX / 2, "the budget is not far too small");
+        assert!(wire(&env) > PAGE_MAX / 2, "the budget is not far too small ({})", wire(&env));
+        assert!(wire(&env) <= PAGE_MAX - 16 * 1024, "keeps a 16 KiB safety margin ({})", wire(&env));
         let page = log.page(&node, 0, 4096);
         let env = Envelope::seal(&SEED, &uid, "bookmarks", 0, "peer-b", &Message::Page(Page { typ: "bookmarks".into(), page })).unwrap();
         assert!(wire(&env) <= PAGE_MAX);

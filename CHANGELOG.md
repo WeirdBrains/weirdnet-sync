@@ -6,6 +6,15 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Breaking: depends on weirdnet-net 0.8 (its types are in this crate's API, so apps move to 0.8 with it). Requests and replies now carry byte fields as CBOR byte strings, so the sync request-response protocol id is `/weirdnet/sync/2` (was `/1`) and a 0.4 node and a 0.5 node fail to negotiate rather than fail to decode. Upgrade every device together.
+- `PAGE_BUDGET` is now `(PAGE_MAX - 16 KiB) / 2 - 8 KiB` (114,688 bytes; was about 60 KiB). A page is hex-sealed (2x) inside one CBOR byte string (1x), no longer four times the plaintext. A full page is about 225 KiB on the wire, under the 256 KiB `PAGE_MAX`; `CHUNK_MAX` grows with it. The test measures the real 0.8 encoding and keeps a 16 KiB margin.
+
+### Compatibility
+
+- Stored data is unchanged: op logs, records, chunks, sealed values and key chains read exactly as in 0.4. Only the network protocol moved.
+
 ## [0.4.0] - 2026-11-18
 
 ### Added

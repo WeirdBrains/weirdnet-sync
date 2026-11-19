@@ -59,7 +59,7 @@ A value larger than `Limits::inline_max` (after sealing) is split into `Limits::
 
 ## Protocol
 
-`/weirdnet/sync/1`, length-prefixed CBOR, one request/reply at a time (the same style as `/weirdnet/link/1`). After the authenticated channel is up, payloads that carry records, cursors or certificates are sealed. Messages: `Hello` / `HelloOk` or `Refuse`, `Pull`, `Page`, `Ack`, `Roster`.
+`/weirdnet/sync/2`, length-prefixed CBOR, one request/reply at a time (the same style as `/weirdnet/link/1`). After the authenticated channel is up, payloads that carry records, cursors or certificates are sealed. Messages: `Hello` / `HelloOk` or `Refuse`, `Pull`, `Page`, `Ack`, `Roster`.
 
 A session is accepted only if the peer presents a `NodeCert` for the same user that `WEIRDNET.verify_cert` accepts and that is not revoked.
 
@@ -80,7 +80,7 @@ A revocation bumps the roster epoch. A hello from an unrevoked device of the sam
 Published on crates.io; the current release is 0.4.0. It adds large records (values over
 `Limits::inline_max` are split into BLAKE3-checked chunks) and sealed records (per-record keys
 from the head epoch key, so a device revoked before a write cannot read it), budgets pages so a
-full page fits the 256 KiB reply cap, adds `Roster::check_caller`, and moves to weirdnet-net 0.7.
+full page fits the 256 KiB reply cap, adds `Roster::check_caller`, and moves to weirdnet-net 0.7. The next release moves to weirdnet-net 0.8 (protocol `/weirdnet/sync/2`, larger pages).
 Peers on 0.3 keep working and see the fallback value. Key rotation on revoke shipped in 0.3.0,
 with two fixes in 0.3.1.
 See `CHANGELOG.md`.

@@ -1,4 +1,4 @@
-//! The pull protocol running on a [`weirdnet_net::Node`] (`/weirdnet/sync/1`).
+//! The pull protocol running on a [`weirdnet_net::Node`] (`/weirdnet/sync/2`).
 //!
 //! The official WeirdBrains relay must not store pages; this module only exchanges
 //! sealed envelopes between the user's own nodes.
