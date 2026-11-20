@@ -6,6 +6,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-19
+
 ### Added
 
 - `identity::Identity` (re-exported with `LinkSettings` and `Tick`): the on-disk identity store apps with linked devices share (seed, node key and cert, epoch keys, roster), parameterised on the sync type. `create`, `adopt` (a device link), `open`, `approve`, `revoke`, `link_settings`, `roster_view`, and `tick`, a `pull_from_shared` pass against every linked device that reports devices reached, entries applied and per-device errors. Same files as Ymir's `membership` and Bragi's `identity`, which it replaces.
@@ -103,7 +105,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 - HLC, op log, LWW registers, OR-sets, tombstone GC, SyncKey page sealing, roster / self-cert / revocation, and the `weirdnet-sync/v1` protocol over `weirdnet-net` 0.6.0.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.4.0...v0.5.0

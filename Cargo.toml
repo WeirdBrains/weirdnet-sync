@@ -1,6 +1,6 @@
 [package]
 name = "weirdnet-sync"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.99"
 description = "Weirdnet sync: hybrid logical clocks, an op log, LWW and OR-set merge, tombstone GC, SyncKey page sealing, a device roster with self-cert, revocation and key rotation with re-admission, and the weirdnet-sync/v1 pull protocol over weirdnet-net."
