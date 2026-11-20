@@ -87,9 +87,20 @@ A server (a model or inference node) can join with a certificate only, never the
 - Its secrets (`node.key`, `keys`) go through a `SecretStore` (0600 files by default, `FileSecrets`; pass an OS keystore with the `*_with` constructors).
 - A service device needs a 0.7 peer: a 0.6 device cannot open unsealed messages.
 
+## Leases, plans and jobs (unreleased, 0.8)
+
+The op log is eventually consistent, so it can't give mutual exclusion. For "one device decides" (a scheduler) and "one device works on this job", 0.8 adds a majority-vote lease with fencing terms, and two kinds of records ordered by term instead of clock.
+
+- **Voters** are the devices the user granted a role (`Voters::Role("ymir.inference")`; `Voters::Peers` for a fixed set), with an active certificate. Only voters stand. A device votes once it has a `Voter` (`SyncState::set_voter`, or `Identity::enable_voter`, which keeps its terms in `voter.cbor` and writes each new term before granting it).
+- **Leases** (`Leases::acquire`, `renew`, `release`, or an `Elector` that keeps one in the background): a candidate asks every voter at once with term = highest seen + 1 and holds the lease once a majority granted it. Its handle is valid until `asked_at + duration × (1 − max_drift) − 50 ms` by its own monotonic clock, so it always stops before any voter's promise ends. A voter promises one holder at a time, never grants a term twice, refuses takeovers for one lease duration after a restart, and only answers candidates that count the same voter set (`Voters::digest`). No preemption: a live holder keeps the lease; after a lapse the lowest-ranked candidate tries first. Defaults: 15 s leases, renewed every 5 s, 1 % drift, 500 ms stagger per rank.
+- **Fencing**: every command that matters carries the lease's `Term`; resources keep a `FenceGuard` (persist `export`) and refuse a term older than one they have seen, so a paused or partitioned ex-holder does no harm.
+- **Plans** (`publish_plan`, `current_plan`, `current_plan_where`): one signed document per name, versioned within a term; the newest by `(term, version)` from an active signer wins, whatever the HLC says.
+- **Jobs** (`Jobs::post`, `record`, `cancel`, `view`, `open`, and `Leases::claim_job`): claiming a job is acquiring the lease `<type>/<job id>`; its term fences the attempt. Checkpoints, results and failures count only from the device that claimed that term. When a worker dies its claim lapses and another voter claims the next term and resumes from `JobView::resume_from`.
+- Lease messages (`LeaseAsk`, `LeaseGrant`, `LeaseDeny`, `LeaseFree`) travel on `/weirdnet/sync/2` sealed under the head key, so only admitted, unrevoked devices of the user take part. Change the voter set one device at a time and let the roster reach every voter before the next change: two candidates with different views of a voter set that changed by several devices at once could each count a majority.
+
 ## Protocol
 
-`/weirdnet/sync/2`, length-prefixed CBOR, one request/reply at a time (the same style as `/weirdnet/link/1`). After the authenticated channel is up, payloads that carry records, cursors or certificates are sealed. Messages: `Hello` / `HelloOk` or `Refuse`, `Pull`, `Page`, `Ack`, `Roster`.
+`/weirdnet/sync/2`, length-prefixed CBOR, one request/reply at a time (the same style as `/weirdnet/link/1`). After the authenticated channel is up, payloads that carry records, cursors or certificates are sealed. Messages: `Hello` / `HelloOk` or `Refuse`, `Pull`, `Page`, `Ack`, `Roster`, and (0.8) `LeaseAsk` / `LeaseGrant` or `LeaseDeny`, `LeaseFree`.
 
 A session is accepted only if the peer presents a `NodeCert` for the same user that `WEIRDNET.verify_cert` accepts and that is not revoked.
 
@@ -113,5 +124,5 @@ A pull applies and acks page by page, so when a later page is refused (or the ne
 
 ## Status
 
-Published on crates.io; the current release is 0.7.0. It adds service devices linked without the seed, user-signed device grants (roles) and a pluggable secret store; `SyncState::seed` is now an `Option`. 0.6.0 added the shared identity store (`Identity`) and made `SyncError` non-exhaustive. 0.5.2 fixed a device linked on one device not reaching the others in one pass; 0.5 moved to weirdnet-net 0.8 (protocol `/weirdnet/sync/2`, larger pages) and added `SyncState::snapshot`/`merge_back` and `pull_from_shared`. Large and sealed records shipped in 0.4, key rotation on revoke in 0.3.
+Published on crates.io; the current release is 0.7.0 (main adds leases, plans and jobs for the next minor release). 0.7.0 added service devices linked without the seed, user-signed device grants (roles) and a pluggable secret store; `SyncState::seed` is now an `Option`. 0.6.0 added the shared identity store (`Identity`) and made `SyncError` non-exhaustive. 0.5.2 fixed a device linked on one device not reaching the others in one pass; 0.5 moved to weirdnet-net 0.8 (protocol `/weirdnet/sync/2`, larger pages) and added `SyncState::snapshot`/`merge_back` and `pull_from_shared`. Large and sealed records shipped in 0.4, key rotation on revoke in 0.3.
 See `CHANGELOG.md`.

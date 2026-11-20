@@ -6,6 +6,15 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+Planned as 0.8.0 (breaking: `SyncState` gains a `voter` field, `Message` gains lease variants).
+
+### Added
+
+- `lease`: majority-vote leases with fencing terms. `Voters` (role grants or fixed peers), `LeaseConfig` (defaults 15 s, renew every 5 s, 1 % drift, 500 ms stagger), `Voter` with persistence and a restart grace, `Leases::acquire`/`renew`/`release`, `Elector`, `LeaseHandle`, `LeaseState`, `LeaseError`, `FenceGuard`, `LeaseRecord`. Messages `LeaseAsk`, `LeaseGrant`, `LeaseDeny`, `LeaseFree` on `/weirdnet/sync/2`.
+- `plan`: signed, versioned plans ordered by `(term, version)` (`SyncState::publish_plan`, `current_plan`, `current_plan_where`).
+- `jobs`: a job log with per-job claim leases, checkpoints, results, retries and re-claims (`Jobs`, `JobSpec`, `JobEvent`, `JobView`, `JobStatus`, `job_lease`, `Leases::claim_job`).
+- `Identity::enable_voter`, `enable_voter_with`, `disable_voter` (terms kept in `voter.cbor`).
+
 ## [0.7.0] - 2026-11-20
 
 Releases as 0.7.0 (breaking: `SyncState::seed` is an `Option`, `Roster` and `KeyStatus` grow, new messages).
