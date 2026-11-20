@@ -6,6 +6,10 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A device linked on one device (no revocation or rotation, so no epoch change) now reaches the others in one pass. `HelloOk` lists every cert the answering node holds, not only the revoked ones (the field keeps its wire name `revocations`), and a puller whose peer lacks one of its certs sends it the roster. Before, a new cert spread only by luck of which device started the first rotation, so a pass could end without error and the new device stay unknown. Wire-compatible both ways: older nodes merge the extra certs as before, and a puller hands an older peer its roster on each pass (one small request).
+
 ## [0.5.1] - 2026-11-19
 
 ### Added

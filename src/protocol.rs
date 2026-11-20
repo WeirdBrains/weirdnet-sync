@@ -55,6 +55,8 @@ pub struct HelloOk {
     pub cert: NodeCert,
     pub epoch: u32,
     pub cursors: Cursors,
+    /// The answering node's certs. Since 0.5.2 every cert, active and revoked (the name
+    /// is kept for the wire); before that only the revoked ones.
     pub revocations: Vec<NodeCert>,
     #[serde(default)]
     pub chain: KeyChain,

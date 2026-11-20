@@ -273,7 +273,9 @@ impl SyncState {
             return Message::Refuse(Refuse::new(check.reason().unwrap_or("wrong-user")));
         }
         let cursors = self.log.cursors().into_iter().collect();
-        let revocations = self.roster.certs.iter().filter(|c| !c.active()).cloned().collect();
+        // Every cert, not only the revoked ones: a device linked here (no revocation, no
+        // rotation, so no epoch change) must reach a puller that has never seen it.
+        let revocations = self.roster.certs.clone();
         Message::HelloOk(HelloOk { cert: self.our_cert.clone(), epoch: self.roster.epoch, cursors, revocations, chain: self.roster.chain.shared() })
     }
 
@@ -478,11 +480,14 @@ fn pull_session(
             _ => return Err(SyncError::Protocol("expected HelloOk".into())),
         }
     };
-    let behind = ok.epoch < state.roster.epoch;
+    // The peer missed a revocation we hold, or lacks a cert we hold (a device linked or
+    // revoked here). A peer before 0.5.2 lists only revoked certs, so it gets the roster
+    // on every pass: one small extra request.
+    let behind = ok.epoch < state.roster.epoch || peer_lacks_certs(&state.roster, &ok.revocations, &ok.cert);
     state.absorb(ok.revocations.into_iter().chain([ok.cert]).collect(), ok.epoch, ok.chain);
     let key = state.current_key();
     if behind {
-        // The peer missed a revocation we hold: hand it our roster so it can catch up.
+        // Hand the peer our roster so it can catch up.
         let env = state.seal_envelope(&key, typ_name, &from, &state.roster_msg())?;
         let _ = request(node, peer, addrs, &env)?;
     }
@@ -508,6 +513,15 @@ fn pull_session(
         state.rotate(now_ms() as i64)?;
     }
     Ok(())
+}
+
+/// Whether the peer's HelloOk (its own cert and its cert list) lacks one of `ours`: a cert
+/// it has never seen, or one it still holds active that we hold revoked.
+fn peer_lacks_certs(ours: &Roster, theirs: &[NodeCert], their_cert: &NodeCert) -> bool {
+    ours.certs.iter().any(|c| match theirs.iter().chain([their_cert]).find(|t| t.peer_id == c.peer_id) {
+        None => true,
+        Some(t) => t.active() && !c.active(),
+    })
 }
 
 /// Pull `typ_name` of every node in `nodes` under `key`, adding new entries to
@@ -1542,5 +1556,33 @@ mod tests {
         drop(st);
         // Folding the same snapshot again changes nothing.
         assert_eq!(b.0.lock().unwrap().merge_back(&snap), MergeOutcome::default());
+    }
+
+    /// B links a new device C that A has never seen (no revocation, no rotation, so no
+    /// epoch change). One pass either way must carry C's cert to A: A pulling from B
+    /// (HelloOk lists B's certs), and B pulling from A (B pushes what A lacks).
+    #[test]
+    fn a_device_linked_elsewhere_reaches_the_others_in_one_pass() {
+        let user = Keypair::generate_ed25519();
+        let uid = user::user_id(&user.public());
+        for a_pulls in [true, false] {
+            let g = linked(&user, &["a", "b"]);
+            let (a, b) = (&g[0], &g[1]);
+            let kc = Keypair::generate_ed25519();
+            let (sc, _) = state(&user, &kc, &uid, "c", &["bookmarks"]);
+            let c_cert = sc.lock().unwrap().our_cert.clone();
+            let c_peer = c_cert.peer_id.clone();
+            b.0.lock().unwrap().approve(c_cert, 5).unwrap();
+            assert!(a.0.lock().unwrap().roster.get(&c_peer).is_none());
+            let out = if a_pulls {
+                pull_from_shared(&a.0, &a.1, b.1.peer_id(), &addrs(&b.1), typ::BOOKMARKS)
+            } else {
+                pull_from_shared(&b.0, &b.1, a.1.peer_id(), &addrs(&a.1), typ::BOOKMARKS)
+            };
+            assert!(out.is_ok(), "{:?}", out.error);
+            let st = a.0.lock().unwrap();
+            assert!(st.roster.get(&c_peer).is_some_and(|c| c.active()), "a_pulls={a_pulls}: A never learned C");
+            assert_eq!(st.roster.epoch, b.0.lock().unwrap().roster.epoch);
+        }
     }
 }
