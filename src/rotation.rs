@@ -142,7 +142,7 @@ impl Device {
         Ok(DeviceKey { peer_id: peer, exchange, at_ms, sig })
     }
 
-    fn sign(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn sign(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         self.node.sign(bytes).map_err(|e| crypto(format!("sign: {e}")))
     }
 }

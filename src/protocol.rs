@@ -122,6 +122,11 @@ pub enum Message {
     Page(Page),
     Ack(Ack),
     Roster(RosterMsg),
+    /// Leases (0.8): a candidate's ask, a voter's grant or denial, a release.
+    LeaseAsk(crate::lease::LeaseAsk),
+    LeaseGrant(crate::lease::LeaseGrant),
+    LeaseDeny(crate::lease::LeaseDeny),
+    LeaseFree(crate::lease::LeaseFree),
 }
 
 /// What goes on the request-response wire: type, epoch and (after a rotation) the

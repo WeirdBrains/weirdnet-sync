@@ -127,6 +127,7 @@ struct Credential {
 }
 
 const CREDENTIAL: &str = "credential.json";
+const VOTER: &str = "voter.cbor";
 
 /// The user identity, this node's key and certificate, and the roster, stored in a directory.
 pub struct Identity {
@@ -361,6 +362,7 @@ impl Identity {
             keys,
             auto_first_rotation: !service,
             records: Default::default(),
+            voter: None,
         };
         st.publish_device_key(now_ms())?;
         st.refresh_keys();
@@ -394,6 +396,35 @@ impl Identity {
         }
         write_private(&self.dir.join("roster.json"), &roster)?;
         self.secrets.write("keys", &keys)
+    }
+
+    /// Make this device a lease voter for `candidates` (see [`crate::lease`]). Its terms are
+    /// kept in `voter.cbor` (public), read back here after a restart and written before each
+    /// new term is granted, so a crash can never hand out a term twice.
+    pub fn enable_voter(&self, candidates: crate::lease::Voters) -> Result<()> {
+        self.enable_voter_with(crate::lease::Voter::new(candidates.clone()), candidates)
+    }
+
+    /// [`enable_voter`](Self::enable_voter) with a configured fresh voter (for example a
+    /// shorter [`Voter::with_max_duration`](crate::lease::Voter::with_max_duration)), used when
+    /// no `voter.cbor` exists yet; a stored one keeps its terms and gets the same maximum.
+    pub fn enable_voter_with(&self, fresh: crate::lease::Voter, candidates: crate::lease::Voters) -> Result<()> {
+        ensure_dir(&self.dir)?;
+        let path = self.dir.join(VOTER);
+        let voter = match std::fs::read(&path) {
+            Ok(bytes) => crate::lease::Voter::import(&bytes, candidates)?.with_max_duration(fresh.max_duration()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => fresh,
+            Err(e) => return Err(io("reading", &path, e)),
+        };
+        let store = path.clone();
+        let voter = voter.with_persist(move |bytes| write_private(&store, bytes).map_err(|e| std::io::Error::other(e.to_string())));
+        self.lock().set_voter(Some(voter));
+        Ok(())
+    }
+
+    /// Stop voting (the stored terms stay on disk).
+    pub fn disable_voter(&self) {
+        self.lock().set_voter(None);
     }
 
     /// Whether this is a service device (linked without the seed).

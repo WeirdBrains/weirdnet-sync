@@ -7,9 +7,12 @@
 
 pub mod hlc;
 pub mod identity;
+pub mod jobs;
+pub mod lease;
 pub mod log;
 pub mod merge;
 pub mod net;
+pub mod plan;
 pub mod protocol;
 pub mod record;
 pub mod roster;
@@ -22,12 +25,15 @@ mod error;
 pub use error::{Result, SyncError};
 pub use hlc::{Hlc, NodeId};
 pub use identity::{FileSecrets, Identity, LinkSettings, SecretStore, Tick};
+pub use jobs::{JobEvent, JobSpec, JobStatus, JobView, Jobs, job_lease};
+pub use lease::{Elector, FenceGuard, LeaseConfig, LeaseError, LeaseHandle, LeaseName, LeaseRecord, LeaseState, Leases, Stale, Term, Voter, Voters};
 pub use log::{LogEntry, OpLog, Page as LogPage};
 pub use merge::{CONFLICT_KEEP_MS, Lww, OrSet, TOMBSTONE_GC_MS, can_gc_tombstone, edit_vs_delete, folder_cycle, lww};
 pub use net::{
     LinkBundle, MergeOutcome, PullOutcome, SyncHandler, SyncState, node_config, pull_chunks, pull_from, pull_from_outcome, pull_from_shared,
     start_node,
 };
+pub use plan::Plan;
 pub use protocol::{
     Ack, Cursors, Envelope, Hello, HelloOk, KeyRef, Message, PAGE_BUDGET, PAGE_MAX, PROTOCOL, Page, Pull, Refuse, RefuseReason, RosterMsg,
     SYNC_PROFILE, decode, decode_framed, encode, encode_framed,

@@ -45,6 +45,9 @@ pub struct SyncState {
     pub auto_first_rotation: bool,
     /// Per-type write options (sealed, size limits); see [`SyncState::configure`].
     pub records: BTreeMap<String, RecordOptions>,
+    /// This device's lease voter, if it votes ([`SyncState::set_voter`]). Persist
+    /// [`Voter::export`](crate::lease::Voter::export); [`SyncState::merge_back`] keeps this one.
+    pub voter: Option<crate::lease::Voter>,
 }
 
 impl SyncState {
@@ -68,6 +71,7 @@ impl SyncState {
             keys: EpochKeys::new(),
             auto_first_rotation: true,
             records: BTreeMap::new(),
+            voter: None,
         };
         if st.device.is_some() {
             st.publish_device_key(st.our_cert.issued_at)?;
@@ -110,6 +114,7 @@ impl SyncState {
             keys,
             auto_first_rotation: false,
             records: BTreeMap::new(),
+            voter: None,
         };
         let at = st.our_cert.issued_at;
         st.publish_device_key(at)?;
@@ -341,7 +346,10 @@ impl SyncState {
                 self.absorb(r.certs, r.epoch, r.chain, r.grants);
                 self.roster_msg()
             }
-            Message::HelloOk(_) | Message::Page(_) | Message::Refuse(_) => {
+            // Leases only under the head key, from a linked device.
+            m @ (Message::LeaseAsk(_) | Message::LeaseFree(_)) if at_head => self.on_lease(from, m),
+            Message::LeaseAsk(_) | Message::LeaseFree(_) => Message::Refuse(Refuse::new("epoch-behind")),
+            Message::HelloOk(_) | Message::Page(_) | Message::Refuse(_) | Message::LeaseGrant(_) | Message::LeaseDeny(_) => {
                 return Err(SyncError::Protocol("unexpected request".into()));
             }
         };
@@ -881,6 +889,7 @@ mod tests {
             keys: EpochKeys::new(),
             auto_first_rotation: false,
             records: BTreeMap::new(),
+            voter: None,
         };
         let mut st = st;
         st.publish_device_key(1).unwrap();
