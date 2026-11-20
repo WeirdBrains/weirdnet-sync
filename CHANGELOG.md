@@ -6,6 +6,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-20
+
 Releases as 0.7.0 (breaking: `SyncState::seed` is an `Option`, `Roster` and `KeyStatus` grow, new messages).
 
 ### Added
@@ -120,7 +122,8 @@ Releases as 0.7.0 (breaking: `SyncState::seed` is an `Option`, `Roster` and `Key
 
 - HLC, op log, LWW registers, OR-sets, tombstone GC, SyncKey page sealing, roster / self-cert / revocation, and the `weirdnet-sync/v1` protocol over `weirdnet-net` 0.6.0.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.0...v0.5.1
