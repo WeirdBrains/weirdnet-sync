@@ -6,6 +6,21 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+Releases as 0.7.0 (breaking: `SyncState::seed` is an `Option`, `Roster` and `KeyStatus` grow, new messages).
+
+### Added
+
+- Service devices linked with a certificate only, never the seed: `SyncState::new_service`, `SyncState::service_bundle`, `LinkBundle`, `Identity::adopt_service`. They cannot admit, revoke, grant or rotate (`SyncError::NotPermitted`).
+- Roster-only service devices (no data keys) that follow certs, revocations, grants and rotations through an unsealed roster swap (`Envelope::clear`, `KeyStatus::RosterOnly`).
+- User-signed device grants with class, roles and sync types (`DeviceGrant`, `DeviceClass`, `Roster::grants`, `grant_of`, `roles_of`, `has_role`, `is_service`, `SyncState::grant`, `Identity::grant`).
+- `SecretStore` and `FileSecrets`, with `Identity::create_with`, `adopt_with`, `adopt_service_with` and `open_with`; `Identity::user_keypair` and `Identity::service_bundle`.
+
+### Changed
+
+- `SyncState::seed` is `Option<Vec<u8>>` (`None` on a service device); `HelloOk` and `RosterMsg` carry grants; `Envelope` has a `clear` flag.
+- Rotations and admissions signed by a service device are ignored; rotations keep service devices with sync types and never include roster-only ones.
+- `Roster::check_caller` admits a service device by its grant without key-chain membership.
+
 ## [0.6.0] - 2026-11-19
 
 ### Added

@@ -75,6 +75,18 @@ let tick = me.tick(&node, &|cert| addrs_for(cert))?;   // one pass against every
 
 `create` never overwrites an identity. `adopt` takes what a device link delivers (seed, the cert the existing device made for this node, and the `LinkSettings` JSON with its roster) and checks the cert is for this node and user. `tick` pulls with `pull_from_shared`, so devices linked or revoked elsewhere arrive even when the type carries no records; it returns the devices reached, entries applied and per-device errors, and saves. `link_settings`, `seed`, `revoke` (rotates keys; never this node's own cert) and `roster_view` cover the rest. The file layout is the one Ymir's `membership` and Bragi's `identity` modules used, so their stores open unchanged.
 
+## Service devices and grants (0.7)
+
+A server (a model or inference node) can join with a certificate only, never the seed, so a stolen server is never the user.
+
+- **`DeviceGrant`**: the user's signed statement of a device's class (`Full` or `Service`), its roles (application strings such as `ymir.inference`, `ymir.model`) and, for a service device, the sync types it may hold keys for. Signed by the user key, so only a seed holder makes one (`SyncState::grant`, `Identity::grant`); it travels in the roster (`Roster::grants`, in `Hello`/`HelloOk`/`Roster`) and the newest that verifies wins. `Roster::grant_of`, `roles_of`, `has_role`, `is_service` read it; a revoked cert's grant counts for nothing. Use roles, not cert labels (labels are not signed), to decide what a device may call.
+- **Linking**: the seed holder calls `service_bundle(peer, roles, types)` (rotating first if the chain has not started and there are types) and sends the bundle with a certificate over a `weirdnet-device-link` 0.4 credential; the node takes it with `SyncState::new_service` or `Identity::adopt_service`, which stores `credential.json` (the user public key) instead of `seed`. Then `approve` the certificate on the linking device as usual.
+- **With types** (an inference node): the bundle carries the epoch keys; later rotations seal to the node like to any device.
+- **Roster-only** (no types; a model node): no data keys at all, never in the key chain. It swaps rosters with its peers unsealed (`Envelope::clear`, only rosters and refusals) on every pass, which is how certs, revocations, grants and rotations reach it.
+- A service device cannot admit, revoke, grant or rotate (`SyncError::NotPermitted`), and rotations or admissions it signs are ignored. Revoking it on a full device (`revoke`) cuts it off and rotates; the root identity is untouched.
+- Its secrets (`node.key`, `keys`) go through a `SecretStore` (0600 files by default, `FileSecrets`; pass an OS keystore with the `*_with` constructors).
+- A service device needs a 0.7 peer: a 0.6 device cannot open unsealed messages.
+
 ## Protocol
 
 `/weirdnet/sync/2`, length-prefixed CBOR, one request/reply at a time (the same style as `/weirdnet/link/1`). After the authenticated channel is up, payloads that carry records, cursors or certificates are sealed. Messages: `Hello` / `HelloOk` or `Refuse`, `Pull`, `Page`, `Ack`, `Roster`.
@@ -101,5 +113,5 @@ A pull applies and acks page by page, so when a later page is refused (or the ne
 
 ## Status
 
-Published on crates.io; the current release is 0.6.0. It adds the shared identity store (`Identity`) and makes `SyncError` non-exhaustive. 0.5.2 fixed a device linked on one device not reaching the others in one pass; 0.5 moved to weirdnet-net 0.8 (protocol `/weirdnet/sync/2`, larger pages) and added `SyncState::snapshot`/`merge_back` and `pull_from_shared`. Large and sealed records shipped in 0.4, key rotation on revoke in 0.3.
+Published on crates.io; the current release is 0.7.0. It adds service devices linked without the seed, user-signed device grants (roles) and a pluggable secret store; `SyncState::seed` is now an `Option`. 0.6.0 added the shared identity store (`Identity`) and made `SyncError` non-exhaustive. 0.5.2 fixed a device linked on one device not reaching the others in one pass; 0.5 moved to weirdnet-net 0.8 (protocol `/weirdnet/sync/2`, larger pages) and added `SyncState::snapshot`/`merge_back` and `pull_from_shared`. Large and sealed records shipped in 0.4, key rotation on revoke in 0.3.
 See `CHANGELOG.md`.
