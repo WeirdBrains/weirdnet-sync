@@ -4,13 +4,17 @@
 //!
 //! An [`Identity`] lives in one directory (0700 on Unix), secrets in 0600 files:
 //!
-//! - `seed`: the user key seed, which a device link delivers;
+//! - `seed`: the user key seed, which a full device link delivers (a service device, linked
+//!   with a certificate only, has none and keeps `credential.json`, the user's public key,
+//!   instead; see [`Identity::adopt_service`]);
 //! - `node.key`: this node's key (libp2p protobuf encoding);
 //! - `keys`: the epoch keys ([`EpochKeys::export`]);
 //! - `roster.json`: the public roster, in the format Morph links with.
 //!
-//! The files are plain, not sealed. Apps that keep secrets in the OS keystore should hold
-//! [`SyncState`] themselves until this store grows a keystore backend.
+//! The secrets (`seed`, `node.key`, `keys`) go through a [`SecretStore`]: 0600 files in the
+//! directory by default ([`FileSecrets`]); apps that keep secrets in the OS keystore pass
+//! their own store to the `*_with` constructors. `roster.json` and `credential.json` are
+//! public and stay files.
 //!
 //! Each identity announces one sync type (`ymir.pool`, `bragi.app`, …). [`Identity::tick`] runs
 //! a pass of that type against every other active device with [`pull_from_shared`], so devices
@@ -38,8 +42,8 @@ use serde::{Deserialize, Serialize};
 use weirdnet_net::user::NodeCert;
 use weirdnet_net::{Keypair, Multiaddr, Node, PeerId, PublicKey, WEIRDNET};
 
-use crate::net::{SyncState, pull_from_shared};
-use crate::roster::Roster;
+use crate::net::{LinkBundle, SyncState, pull_from_shared};
+use crate::roster::{DeviceClass, DeviceGrant, Roster};
 use crate::rotation::{Device, EpochKeys};
 use crate::{NodeId, OpLog, Result, SyncError};
 
@@ -67,11 +71,69 @@ pub struct Tick {
     pub failed: Vec<(String, SyncError)>,
 }
 
+/// Where an [`Identity`] keeps its secrets (`seed`, `node.key`, `keys`): bytes by name.
+/// Implement it over the OS keystore to keep them out of files.
+pub trait SecretStore: Send + Sync {
+    /// The secret, or `None` when it is not stored.
+    fn read(&self, name: &str) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>>;
+    /// Store (replace) the secret.
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<()>;
+    /// Forget the secret (no error when it is not stored).
+    fn remove(&self, name: &str) -> Result<()>;
+}
+
+/// The default [`SecretStore`]: one 0600 file per secret in the identity's directory.
+#[derive(Debug, Clone)]
+pub struct FileSecrets {
+    dir: PathBuf,
+}
+
+impl FileSecrets {
+    pub fn new(dir: &Path) -> Self {
+        Self { dir: dir.to_path_buf() }
+    }
+}
+
+impl SecretStore for FileSecrets {
+    fn read(&self, name: &str) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+        let path = self.dir.join(name);
+        match std::fs::read(&path) {
+            Ok(b) => Ok(Some(zeroize::Zeroizing::new(b))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io("reading", &path, e)),
+        }
+    }
+
+    fn write(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        ensure_dir(&self.dir)?;
+        write_private(&self.dir.join(name), bytes)
+    }
+
+    fn remove(&self, name: &str) -> Result<()> {
+        let path = self.dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io("removing", &path, e)),
+        }
+    }
+}
+
+/// `credential.json` on a service device: the user's public key (protobuf, hex), which a
+/// full device derives from its seed.
+#[derive(Serialize, Deserialize)]
+struct Credential {
+    user_key: String,
+}
+
+const CREDENTIAL: &str = "credential.json";
+
 /// The user identity, this node's key and certificate, and the roster, stored in a directory.
 pub struct Identity {
     dir: PathBuf,
     node_key: Keypair,
     sync_type: String,
+    secrets: Arc<dyn SecretStore>,
     state: Arc<Mutex<SyncState>>,
 }
 
@@ -127,27 +189,38 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 }
 
 impl Identity {
-    /// Whether `dir` holds an identity.
+    /// Whether `dir` holds an identity (with its secrets in files).
     pub fn exists(dir: &Path) -> bool {
-        dir.join("seed").is_file() && dir.join("node.key").is_file()
+        Self::exists_with(dir, &FileSecrets::new(dir))
+    }
+
+    /// Whether `dir` holds an identity whose secrets are in `secrets`.
+    pub fn exists_with(dir: &Path, secrets: &dyn SecretStore) -> bool {
+        let has = |n: &str| secrets.read(n).ok().flatten().is_some();
+        (has("seed") || dir.join(CREDENTIAL).is_file()) && has("node.key")
     }
 
     /// A new Weirdnet user identity with this device as its first node, announcing `sync_type`.
     /// To join the user's existing devices, link from one of them and [`Identity::adopt`].
     /// Never overwrites an identity.
     pub fn create(dir: &Path, label: &str, sync_type: impl Into<String>) -> Result<Self> {
-        if Self::exists(dir) {
+        Self::create_with(dir, Arc::new(FileSecrets::new(dir)), label, sync_type)
+    }
+
+    /// [`Identity::create`] with the secrets in `secrets`.
+    pub fn create_with(dir: &Path, secrets: Arc<dyn SecretStore>, label: &str, sync_type: impl Into<String>) -> Result<Self> {
+        if Self::exists_with(dir, secrets.as_ref()) {
             return Err(err(format!("{} already holds an identity", dir.display())));
         }
-        let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).map_err(|e| err(format!("random seed: {e}")))?;
-        let user = user_from_seed(&seed)?;
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        getrandom::fill(seed.as_mut()).map_err(|e| err(format!("random seed: {e}")))?;
+        let user = user_from_seed(seed.as_ref())?;
         let node_key = Keypair::generate_ed25519();
         let cert = Roster::self_certify(&WEIRDNET, &user, &node_key.public().to_peer_id().to_string(), label, now_ms())
             .map_err(|e| err(format!("certifying this node: {e}")))?;
         let mut roster = Roster::new();
         roster.upsert(cert.clone());
-        let me = Self::build(dir, seed.to_vec(), node_key, cert, roster, EpochKeys::default(), sync_type.into())?;
+        let me = Self::build(dir, secrets, Some(seed.to_vec()), user.public(), node_key, cert, roster, EpochKeys::default(), sync_type.into())?;
         me.save()?;
         Ok(me)
     }
@@ -155,7 +228,20 @@ impl Identity {
     /// The identity a device link delivered: `seed`, the node certificate the existing device
     /// made for `node_key`, and its [`LinkSettings`] (JSON; empty or unreadable means none).
     pub fn adopt(dir: &Path, node_key: Keypair, seed: &[u8], cert: NodeCert, settings: &str, sync_type: impl Into<String>) -> Result<Self> {
-        if Self::exists(dir) {
+        Self::adopt_with(dir, Arc::new(FileSecrets::new(dir)), node_key, seed, cert, settings, sync_type)
+    }
+
+    /// [`Identity::adopt`] with the secrets in `secrets`.
+    pub fn adopt_with(
+        dir: &Path,
+        secrets: Arc<dyn SecretStore>,
+        node_key: Keypair,
+        seed: &[u8],
+        cert: NodeCert,
+        settings: &str,
+        sync_type: impl Into<String>,
+    ) -> Result<Self> {
+        if Self::exists_with(dir, secrets.as_ref()) {
             return Err(err(format!("{} already holds an identity", dir.display())));
         }
         let user = user_from_seed(seed)?;
@@ -167,37 +253,103 @@ impl Identity {
         let mut roster = Roster::new();
         roster.merge(&given.roster, &user.public(), &WEIRDNET);
         roster.upsert(cert.clone());
-        let me = Self::build(dir, seed.to_vec(), node_key, cert, roster, EpochKeys::default(), sync_type.into())?;
+        let me = Self::build(dir, secrets, Some(seed.to_vec()), user.public(), node_key, cert, roster, EpochKeys::default(), sync_type.into())?;
+        me.save()?;
+        Ok(me)
+    }
+
+    /// The identity a **service** link delivered (`weirdnet-device-link`'s credential): the
+    /// user's public key, the node certificate the linking device made for `node_key`, and
+    /// the [`LinkBundle`] (its bytes). No seed: this node verifies, serves and syncs, but
+    /// cannot admit, revoke, grant or rotate, and with a roster-only grant holds no data keys.
+    pub fn adopt_service(
+        dir: &Path,
+        node_key: Keypair,
+        user_key: &[u8],
+        cert: NodeCert,
+        bundle: &[u8],
+        sync_type: impl Into<String>,
+    ) -> Result<Self> {
+        Self::adopt_service_with(dir, Arc::new(FileSecrets::new(dir)), node_key, user_key, cert, bundle, sync_type)
+    }
+
+    /// [`Identity::adopt_service`] with the secrets in `secrets`.
+    pub fn adopt_service_with(
+        dir: &Path,
+        secrets: Arc<dyn SecretStore>,
+        node_key: Keypair,
+        user_key: &[u8],
+        cert: NodeCert,
+        bundle: &[u8],
+        sync_type: impl Into<String>,
+    ) -> Result<Self> {
+        if Self::exists_with(dir, secrets.as_ref()) {
+            return Err(err(format!("{} already holds an identity", dir.display())));
+        }
+        let user_key = PublicKey::try_decode_protobuf(user_key).map_err(|e| err(format!("user key: {e}")))?;
+        if cert.user_id != weirdnet_net::user::user_id(&user_key) {
+            return Err(err("the link's certificate is not for this identity"));
+        }
+        let bundle = LinkBundle::from_bytes(bundle)?;
+        let sync_type = sync_type.into();
+        let st = SyncState::new_service(user_key, cert, &node_key, vec![sync_type.clone()], &bundle)
+            .map_err(|e| err(format!("the service link did not check out: {e}")))?;
+        ensure_dir(dir)?;
+        let me = Self { dir: dir.to_path_buf(), node_key, sync_type, secrets, state: Arc::new(Mutex::new(st)) };
         me.save()?;
         Ok(me)
     }
 
     /// The identity stored in `dir`, if any, announcing `sync_type`.
     pub fn open(dir: &Path, sync_type: impl Into<String>) -> Result<Option<Self>> {
-        if !Self::exists(dir) {
+        Self::open_with(dir, Arc::new(FileSecrets::new(dir)), sync_type)
+    }
+
+    /// [`Identity::open`] with the secrets in `secrets`.
+    pub fn open_with(dir: &Path, secrets: Arc<dyn SecretStore>, sync_type: impl Into<String>) -> Result<Option<Self>> {
+        if !Self::exists_with(dir, secrets.as_ref()) {
             return Ok(None);
         }
-        let seed_path = dir.join("seed");
-        let seed = std::fs::read(&seed_path).map_err(|e| io("reading", &seed_path, e))?;
-        let key_path = dir.join("node.key");
-        let node_key = Keypair::from_protobuf_encoding(&std::fs::read(&key_path).map_err(|e| io("reading", &key_path, e))?)
-            .map_err(|e| err(format!("node key: {e}")))?;
+        let seed = secrets.read("seed")?.map(|s| s.to_vec());
+        let user_key = match &seed {
+            Some(s) => user_from_seed(s)?.public(),
+            None => {
+                let path = dir.join(CREDENTIAL);
+                let c: Credential = serde_json::from_slice(&std::fs::read(&path).map_err(|e| io("reading", &path, e))?)
+                    .map_err(|e| err(format!("{CREDENTIAL}: {e}")))?;
+                let bytes = hex::decode(&c.user_key).map_err(|e| err(format!("{CREDENTIAL}: {e}")))?;
+                PublicKey::try_decode_protobuf(&bytes).map_err(|e| err(format!("{CREDENTIAL}: {e}")))?
+            }
+        };
+        let key_bytes = secrets.read("node.key")?.ok_or_else(|| err("no node key"))?;
+        let node_key = Keypair::from_protobuf_encoding(&key_bytes).map_err(|e| err(format!("node key: {e}")))?;
         let roster: Roster = match std::fs::read(dir.join("roster.json")) {
             Ok(b) => serde_json::from_slice(&b).map_err(|e| err(format!("roster.json: {e}")))?,
             Err(_) => Roster::new(),
         };
-        let keys = std::fs::read(dir.join("keys")).ok().and_then(|b| EpochKeys::import(&b).ok()).unwrap_or_default();
+        let keys = secrets.read("keys")?.and_then(|b| EpochKeys::import(&b).ok()).unwrap_or_default();
         let peer = node_key.public().to_peer_id().to_string();
         let cert = roster.get(&peer).cloned().ok_or_else(|| err("the roster has no certificate for this node"))?;
-        Self::build(dir, seed, node_key, cert, roster, keys, sync_type.into()).map(Some)
+        Self::build(dir, secrets, seed, user_key, node_key, cert, roster, keys, sync_type.into()).map(Some)
     }
 
-    fn build(dir: &Path, seed: Vec<u8>, node_key: Keypair, our_cert: NodeCert, roster: Roster, keys: EpochKeys, sync_type: String) -> Result<Self> {
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        dir: &Path,
+        secrets: Arc<dyn SecretStore>,
+        seed: Option<Vec<u8>>,
+        user_key: PublicKey,
+        node_key: Keypair,
+        our_cert: NodeCert,
+        roster: Roster,
+        keys: EpochKeys,
+        sync_type: String,
+    ) -> Result<Self> {
         ensure_dir(dir)?;
-        let user = user_from_seed(&seed)?;
+        let service = seed.is_none();
         let mut st = SyncState {
             user_id: our_cert.user_id.clone(),
-            user_key: user.public(),
+            user_key,
             our_node: NodeId::new(our_cert.peer_id.clone()),
             our_cert,
             seed,
@@ -207,35 +359,46 @@ impl Identity {
             clock: None,
             device: Device::from_node_key(&node_key).ok(),
             keys,
-            auto_first_rotation: true,
+            auto_first_rotation: !service,
             records: Default::default(),
         };
         st.publish_device_key(now_ms())?;
         st.refresh_keys();
-        Ok(Self { dir: dir.to_path_buf(), node_key, sync_type, state: Arc::new(Mutex::new(st)) })
+        Ok(Self { dir: dir.to_path_buf(), node_key, sync_type, secrets, state: Arc::new(Mutex::new(st)) })
     }
 
     fn lock(&self) -> MutexGuard<'_, SyncState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Writes the roster and keys (and, the first time, the seed and node key).
+    /// Writes the roster and keys (and, the first time, the seed or credential and the node key).
     pub fn save(&self) -> Result<()> {
         ensure_dir(&self.dir)?;
-        let (seed, roster, keys) = {
+        let (seed, user_key, roster, keys) = {
             let st = self.lock();
             let roster = serde_json::to_vec_pretty(&st.roster).map_err(|e| err(format!("roster.json: {e}")))?;
-            (st.seed.clone(), roster, st.keys.export())
+            (st.seed.clone().map(zeroize::Zeroizing::new), st.user_key.encode_protobuf(), roster, st.keys.export())
         };
-        if !self.dir.join("seed").is_file() {
-            write_private(&self.dir.join("seed"), &seed)?;
+        match &seed {
+            Some(seed) if self.secrets.read("seed")?.is_none() => self.secrets.write("seed", seed)?,
+            Some(_) => {}
+            None if !self.dir.join(CREDENTIAL).is_file() => {
+                let c = serde_json::to_vec_pretty(&Credential { user_key: hex::encode(user_key) }).map_err(|e| err(format!("{CREDENTIAL}: {e}")))?;
+                write_private(&self.dir.join(CREDENTIAL), &c)?;
+            }
+            None => {}
         }
-        if !self.dir.join("node.key").is_file() {
-            let key = self.node_key.to_protobuf_encoding().map_err(|e| err(format!("node key: {e}")))?;
-            write_private(&self.dir.join("node.key"), &key)?;
+        if self.secrets.read("node.key")?.is_none() {
+            let key = zeroize::Zeroizing::new(self.node_key.to_protobuf_encoding().map_err(|e| err(format!("node key: {e}")))?);
+            self.secrets.write("node.key", &key)?;
         }
         write_private(&self.dir.join("roster.json"), &roster)?;
-        write_private(&self.dir.join("keys"), &keys)
+        self.secrets.write("keys", &keys)
+    }
+
+    /// Whether this is a service device (linked without the seed).
+    pub fn is_service(&self) -> bool {
+        self.lock().is_service()
     }
 
     /// The directory it is stored in.
@@ -289,9 +452,36 @@ impl Identity {
         serde_json::to_string(&LinkSettings { roster: self.roster() }).unwrap_or_else(|_| "{}".into())
     }
 
-    /// The seed, for a device link sent from here.
+    /// The seed, for a full device link sent from here. A service device has none.
     pub fn seed(&self) -> Result<weirdnet_net::Key32> {
-        weirdnet_net::Key32::from_slice(&self.lock().seed).map_err(|e| err(format!("identity seed: {e}")))
+        let st = self.lock();
+        let seed = st.seed.as_ref().ok_or_else(|| SyncError::NotPermitted("the seed".into()))?;
+        weirdnet_net::Key32::from_slice(seed).map_err(|e| err(format!("identity seed: {e}")))
+    }
+
+    /// The user keypair (secret), for minting the certificate of a device linked from here
+    /// (a service link). A service device has none.
+    pub fn user_keypair(&self) -> Result<Keypair> {
+        let st = self.lock();
+        let seed = st.seed.as_ref().ok_or_else(|| SyncError::NotPermitted("the user key".into()))?;
+        user_from_seed(seed)
+    }
+
+    /// Grant `peer` a class and roles (and, for a service device, sync types), then save.
+    /// Needs the seed.
+    pub fn grant(&self, peer: &str, class: DeviceClass, roles: &[String], types: &[String]) -> Result<DeviceGrant> {
+        let g = self.lock().grant(peer, class, roles, types, now_ms())?;
+        self.save()?;
+        Ok(g)
+    }
+
+    /// The [`LinkBundle`] bytes for a service link to `peer` (see
+    /// [`SyncState::service_bundle`]), then save (the grant, and a first rotation if one was
+    /// needed). After the link, [`Identity::approve`] the certificate it returns.
+    pub fn service_bundle(&self, peer: &str, roles: &[String], types: &[String]) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        let bytes = self.lock().service_bundle(peer, roles, types, now_ms())?.to_bytes()?;
+        self.save()?;
+        Ok(bytes)
     }
 
     /// The user linked `cert`'s device from here: it joins the roster (and the key chain once
@@ -309,7 +499,8 @@ impl Identity {
             if peer == st.our_cert.peer_id {
                 return Err(err("this is this node's own certificate"));
             }
-            let user = user_from_seed(&st.seed)?;
+            let seed = st.seed.as_ref().ok_or_else(|| SyncError::NotPermitted("revoke".into()))?;
+            let user = user_from_seed(seed)?;
             st.revoke(&user, peer, now_ms())?
         };
         self.save()?;

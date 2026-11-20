@@ -6,6 +6,7 @@
 use crate::error::{Result, SyncError};
 use crate::hlc::{Hlc, NodeId};
 use crate::log::{LogEntry, Page as LogPage};
+use crate::roster::DeviceGrant;
 use crate::rotation::KeyChain;
 use crate::seal::{open_page, page_aad_keyed, rotated_sync_key, seal_page, sync_key};
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,9 @@ pub struct HelloOk {
     pub revocations: Vec<NodeCert>,
     #[serde(default)]
     pub chain: KeyChain,
+    /// The answering node's device grants (roles, service class). Absent before 0.7.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<DeviceGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +106,9 @@ pub struct RosterMsg {
     /// Device keys, rotations (with the sealed epoch keys) and admissions.
     #[serde(default)]
     pub chain: KeyChain,
+    /// Device grants (roles, service class). Absent before 0.7.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<DeviceGrant>,
 }
 
 /// Application-level message, before sealing.
@@ -127,6 +134,13 @@ pub struct Envelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     pub sealed: Sealed,
+    /// Since 0.7: the body is not sealed (`sealed.ct` is the hex CBOR message). Only a
+    /// [`Message::Roster`] or a [`Message::Refuse`] travels this way: the roster is public
+    /// (every part verifies under the user key) and a refusal is a reason code, over a
+    /// stream Noise already authenticated. Service devices, which hold no seed, use it to
+    /// refuse and to fetch the roster. A 0.6 peer cannot open it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear: bool,
 }
 
 /// Which key an envelope is sealed under: the seed-derived one at `epoch`, or the
@@ -144,12 +158,34 @@ impl KeyRef {
 }
 
 impl Envelope {
+    /// An unsealed envelope (see [`Envelope::clear`]). Only a roster or a refusal may be sent so.
+    pub fn clear(typ: &str, epoch: u32, msg: &Message) -> Result<Self> {
+        if !matches!(msg, Message::Roster(_) | Message::Refuse(_)) {
+            return Err(SyncError::Protocol("only a roster or a refusal travels unsealed".into()));
+        }
+        let plain = encode(msg)?;
+        Ok(Self { typ: typ.into(), epoch, key: None, sealed: Sealed { nonce: String::new(), ct: hex::encode(plain) }, clear: true })
+    }
+
+    /// The message of an unsealed envelope. Anything but a roster or a refusal is refused.
+    pub fn open_clear(&self) -> Result<Message> {
+        if !self.clear {
+            return Err(SyncError::Crypto("sealed envelope".into()));
+        }
+        let plain = hex::decode(&self.sealed.ct).map_err(|e| SyncError::Codec(e.to_string()))?;
+        let msg: Message = decode(&plain)?;
+        if !matches!(msg, Message::Roster(_) | Message::Refuse(_)) {
+            return Err(SyncError::Protocol("only a roster or a refusal travels unsealed".into()));
+        }
+        Ok(msg)
+    }
+
     /// Seal under a rotated epoch key (rotation `id`).
     pub fn seal_keyed(epoch_key: &Key32, id: &str, user_id: &str, typ: &str, epoch: u32, asking_peer: &str, msg: &Message) -> Result<Self> {
         let key = rotated_sync_key(epoch_key, user_id, typ, epoch, id)?;
         let plain = encode(msg)?;
         let sealed = weirdnet_keys::seal(&key, &plain, &page_aad_keyed(typ, epoch, id, asking_peer))?;
-        Ok(Self { typ: typ.into(), epoch, key: Some(id.into()), sealed })
+        Ok(Self { typ: typ.into(), epoch, key: Some(id.into()), sealed, clear: false })
     }
 
     pub fn open_keyed(&self, epoch_key: &Key32, user_id: &str, asking_peer: &str) -> Result<Message> {
@@ -163,12 +199,12 @@ impl Envelope {
         let key = sync_key(seed, user_id, typ, epoch)?;
         let plain = encode(msg)?;
         let sealed = seal_page(&key, typ, epoch, asking_peer, &plain)?;
-        Ok(Self { typ: typ.into(), epoch, key: None, sealed })
+        Ok(Self { typ: typ.into(), epoch, key: None, sealed, clear: false })
     }
 
     /// Open a seed-sealed envelope. One sealed under a rotated key fails here.
     pub fn open(&self, seed: &[u8], user_id: &str, asking_peer: &str) -> Result<Message> {
-        if self.key.is_some() {
+        if self.key.is_some() || self.clear {
             return Err(SyncError::Crypto("sealed under a rotated key".into()));
         }
         let key = sync_key(seed, user_id, &self.typ, self.epoch)?;
@@ -310,7 +346,10 @@ mod tests {
             Roster { certs: Vec<NodeCert>, epoch: u32 },
         }
         let old = encode(&OldMessage::Roster { certs: vec![], epoch: 3 }).unwrap();
-        assert_eq!(decode::<Message>(&old).unwrap(), Message::Roster(RosterMsg { certs: vec![], epoch: 3, chain: KeyChain::default() }));
+        assert_eq!(
+            decode::<Message>(&old).unwrap(),
+            Message::Roster(RosterMsg { certs: vec![], epoch: 3, chain: KeyChain::default(), grants: vec![] })
+        );
         // A keyed envelope never opens as a seed one.
         let k = Key32::random().unwrap();
         let keyed = Envelope::seal_keyed(&k, "r1", &uid, "bookmarks", 1, "peer-b", &msg).unwrap();

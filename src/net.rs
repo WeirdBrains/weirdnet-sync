@@ -7,12 +7,14 @@ use crate::hlc::{Hlc, NodeId};
 use crate::log::OpLog;
 use crate::protocol::{Ack, Envelope, Hello, HelloOk, KeyRef, Message, PAGE_MAX, Pull, Refuse, RosterMsg, SYNC_PROFILE, decode, encode};
 use crate::record::{RecordOptions, base_type, chunk_type, is_chunk_type};
-use crate::roster::{Roster, SessionCheck};
-use crate::rotation::{Device, EpochKeys, KeyChain};
+use crate::roster::{CallerCheck, DeviceClass, DeviceGrant, Roster, SessionCheck};
+use crate::rotation::{Device, EpochKeys, KeyChain, KeyStatus};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use weirdnet_net::user::NodeCert;
 use weirdnet_net::{Handler, Keypair, Multiaddr, Node, NodeConfig, PeerId, PublicKey, WEIRDNET};
+use zeroize::Zeroize;
 
 /// Mutable state a sync node answers from and applies pages into.
 ///
@@ -21,7 +23,9 @@ use weirdnet_net::{Handler, Keypair, Multiaddr, Node, NodeConfig, PeerId, Public
 /// [`SyncState::merge_back`] (or let [`pull_from_shared`] do both).
 #[derive(Clone)]
 pub struct SyncState {
-    pub seed: Vec<u8>,
+    /// The identity seed; `None` on a service device (linked with a certificate only,
+    /// see [`SyncState::new_service`]), which then cannot admit, revoke, grant or rotate.
+    pub seed: Option<Vec<u8>>,
     pub user_id: String,
     pub user_key: PublicKey,
     pub our_cert: NodeCert,
@@ -51,7 +55,7 @@ impl SyncState {
         let mut roster = Roster::new();
         roster.upsert(our_cert.clone());
         let mut st = Self {
-            seed,
+            seed: Some(seed),
             user_id: our_cert.user_id.clone(),
             user_key,
             our_node: NodeId::new(our_cert.peer_id.clone()),
@@ -71,6 +75,97 @@ impl SyncState {
         Ok(st)
     }
 
+    /// A service device: linked with a certificate and a [`DeviceGrant`], without the
+    /// seed (see [`SyncState::new_service`]). It verifies, serves and syncs like any
+    /// device, but cannot admit, revoke, grant or rotate (`SyncError::NotPermitted`), and
+    /// a roster-only one (no sync types in its grant) holds no data keys at all.
+    pub fn new_service(user_key: PublicKey, our_cert: NodeCert, node_key: &Keypair, types: Vec<String>, bundle: &LinkBundle) -> Result<Self> {
+        let peer = node_key.public().to_peer_id().to_string();
+        if our_cert.peer_id != peer || !our_cert.active() || !WEIRDNET.verify_cert(&user_key, &our_cert) {
+            return Err(SyncError::Refused("the certificate is not this node's".into()));
+        }
+        let g = &bundle.grant;
+        if g.peer_id != peer || g.class != DeviceClass::Service || !g.verify(&user_key) {
+            return Err(SyncError::Refused("the grant is not a service grant for this node".into()));
+        }
+        let mut roster = Roster::new();
+        roster.merge(&bundle.roster, &user_key, &WEIRDNET);
+        roster.upsert(our_cert.clone());
+        roster.add_grant(g.clone(), &user_key);
+        let keys = match (&bundle.keys, g.roster_only()) {
+            (Some(k), false) => EpochKeys::import(k)?,
+            _ => EpochKeys::new(),
+        };
+        let mut st = Self {
+            seed: None,
+            user_id: our_cert.user_id.clone(),
+            user_key,
+            our_node: NodeId::new(our_cert.peer_id.clone()),
+            our_cert,
+            types,
+            roster,
+            log: OpLog::new(),
+            clock: None,
+            device: Some(Device::from_node_key(node_key)?),
+            keys,
+            auto_first_rotation: false,
+            records: BTreeMap::new(),
+        };
+        let at = st.our_cert.issued_at;
+        st.publish_device_key(at)?;
+        st.refresh_keys();
+        Ok(st)
+    }
+
+    /// Whether this is a service device (no seed).
+    pub fn is_service(&self) -> bool {
+        self.seed.is_none()
+    }
+
+    /// The user keypair, from the seed. A service device has none.
+    fn user_keypair(&self, what: &str) -> Result<Keypair> {
+        let seed = self.seed.as_ref().ok_or_else(|| SyncError::NotPermitted(what.into()))?;
+        let mut bytes: [u8; 32] = seed.as_slice().try_into().map_err(|_| SyncError::Crypto("the identity seed is not 32 bytes".into()))?;
+        let kp = Keypair::ed25519_from_bytes(&mut bytes).map_err(|e| SyncError::Crypto(format!("identity seed: {e}")));
+        bytes.zeroize();
+        kp
+    }
+
+    /// Sign a [`DeviceGrant`] for `peer_id` with the user key and put it in the roster
+    /// (it spreads with the roster). Replaces the device's earlier grant. Needs the seed.
+    pub fn grant(&mut self, peer_id: &str, class: DeviceClass, roles: &[String], types: &[String], at_ms: i64) -> Result<DeviceGrant> {
+        let user = self.user_keypair("grant")?;
+        let g = DeviceGrant::sign(&user, peer_id, class, roles, types, at_ms)?;
+        let key = self.user_key.clone();
+        if !self.roster.add_grant(g.clone(), &key) {
+            return Err(SyncError::Protocol("a newer grant for this device is already held".into()));
+        }
+        Ok(g)
+    }
+
+    /// What a service link to `peer_id` carries for sync (see [`LinkBundle`]): a service
+    /// grant with `roles` and `types` (kept in this roster too), the roster, and, when
+    /// `types` is not empty, the epoch keys this device holds. With types and no rotation
+    /// yet, this rotates first, so a service device never needs a seed-derived key. Needs
+    /// the seed. After the link, [`SyncState::approve`] the node's certificate as usual.
+    pub fn service_bundle(&mut self, peer_id: &str, roles: &[String], types: &[String], at_ms: i64) -> Result<LinkBundle> {
+        let grant = self.grant(peer_id, DeviceClass::Service, roles, types, at_ms)?;
+        let keys = if grant.roster_only() {
+            None
+        } else {
+            if self.roster.head_id().is_none() {
+                self.rotate(at_ms)?;
+            }
+            if !matches!(self.key_status(), KeyStatus::Current { .. }) {
+                return Err(SyncError::Refused("needs-admission".into()));
+            }
+            Some(self.keys.export().to_vec())
+        };
+        let mut roster = self.roster.clone();
+        roster.chain = roster.chain.shared();
+        Ok(LinkBundle { roster, grant, keys })
+    }
+
     /// The key new envelopes are sealed with: the head epoch key when we hold it,
     /// otherwise the seed-derived key (enough to catch up and be re-admitted).
     pub fn current_key(&self) -> KeyRef {
@@ -85,7 +180,10 @@ impl SyncState {
 
     pub fn seal_envelope(&self, key: &KeyRef, typ: &str, peer: &str, msg: &Message) -> Result<Envelope> {
         match &key.id {
-            None => Envelope::seal(&self.seed, &self.user_id, typ, key.epoch, peer, msg),
+            None => match &self.seed {
+                Some(seed) => Envelope::seal(seed, &self.user_id, typ, key.epoch, peer, msg),
+                None => Err(SyncError::Crypto("no epoch key yet (a service device has no seed-derived key)".into())),
+            },
             Some(id) => {
                 let k = self.keys.get(id).ok_or_else(|| SyncError::Crypto("unknown epoch key".into()))?;
                 Envelope::seal_keyed(k, id, &self.user_id, typ, key.epoch, peer, msg)
@@ -94,8 +192,14 @@ impl SyncState {
     }
 
     pub fn open_envelope(&self, env: &Envelope, peer: &str) -> Result<Message> {
+        if env.clear {
+            return env.open_clear();
+        }
         match &env.key {
-            None => env.open(&self.seed, &self.user_id, peer),
+            None => match &self.seed {
+                Some(seed) => env.open(seed, &self.user_id, peer),
+                None => Err(SyncError::Crypto("seed-sealed envelope on a service device".into())),
+            },
             Some(id) => {
                 let k = self.keys.get(id).ok_or_else(|| SyncError::Crypto("unknown epoch key".into()))?;
                 env.open_keyed(k, &self.user_id, peer)
@@ -104,13 +208,18 @@ impl SyncState {
     }
 
     fn roster_msg(&self) -> Message {
-        Message::Roster(RosterMsg { certs: self.roster.certs.clone(), epoch: self.roster.epoch, chain: self.roster.chain.shared() })
+        Message::Roster(RosterMsg {
+            certs: self.roster.certs.clone(),
+            epoch: self.roster.epoch,
+            chain: self.roster.chain.shared(),
+            grants: self.roster.grants.clone(),
+        })
     }
 
-    /// Merge certs, epoch and chain from a peer, then open any key sealed to us.
-    fn absorb(&mut self, certs: Vec<NodeCert>, epoch: u32, chain: KeyChain) {
+    /// Merge certs, epoch, chain and grants from a peer, then open any key sealed to us.
+    fn absorb(&mut self, certs: Vec<NodeCert>, epoch: u32, chain: KeyChain, grants: Vec<DeviceGrant>) {
         let key = self.user_key.clone();
-        self.roster.merge(&Roster { epoch, certs, chain }, &key, &WEIRDNET);
+        self.roster.merge(&Roster { epoch, certs, chain, grants }, &key, &WEIRDNET);
         self.refresh_keys();
     }
 
@@ -205,6 +314,9 @@ impl SyncState {
     }
 
     pub fn handle(&mut self, from: &str, env: Envelope) -> Result<Envelope> {
+        if env.clear {
+            return self.handle_clear(from, env);
+        }
         let key = KeyRef { epoch: env.epoch, id: env.key.clone() };
         // Open with our keys and user id; a foreign user fails here (wrong-user).
         let msg = match self.open_envelope(&env, from) {
@@ -226,7 +338,7 @@ impl SyncState {
             // An ack is the puller's progress, not ours: it must not move our cursors.
             Message::Ack(a) => Message::Ack(Ack { node_id: a.node_id, last_seq: a.last_seq }),
             Message::Roster(r) => {
-                self.absorb(r.certs, r.epoch, r.chain);
+                self.absorb(r.certs, r.epoch, r.chain, r.grants);
                 self.roster_msg()
             }
             Message::HelloOk(_) | Message::Page(_) | Message::Refuse(_) => {
@@ -237,8 +349,38 @@ impl SyncState {
         self.seal_envelope(&key, &env.typ, from, &reply)
     }
 
+    /// A refusal: under the seed key for a peer that cannot open ours (as through 0.6),
+    /// or unsealed from a service device, which has no seed.
     fn refuse(&self, from: &str, typ: &str, epoch: u32, reason: &'static str) -> Result<Envelope> {
-        Envelope::seal(&self.seed, &self.user_id, typ, epoch, from, &Message::Refuse(Refuse::new(reason)))
+        let msg = Message::Refuse(Refuse::new(reason));
+        match &self.seed {
+            Some(seed) => Envelope::seal(seed, &self.user_id, typ, epoch, from, &msg),
+            None => Envelope::clear(typ, epoch, &msg),
+        }
+    }
+
+    /// An unsealed request: a roster from a device of this user (a service device catching
+    /// up, or a peer that cannot open what we seal), answered with ours, unsealed. Only an
+    /// active device of this user gets it.
+    fn handle_clear(&mut self, from: &str, env: Envelope) -> Result<Envelope> {
+        let r = match env.open_clear()? {
+            Message::Roster(r) => r,
+            _ => return Err(SyncError::Protocol("unexpected request".into())),
+        };
+        // Judge the caller before taking anything from it: our roster plus the certs it
+        // sent (each must verify under the user key to count).
+        let key = self.user_key.clone();
+        let mut probe = Roster { epoch: self.roster.epoch, certs: self.roster.certs.clone(), ..Roster::default() };
+        probe.merge(&Roster { certs: r.certs.clone(), ..Roster::default() }, &key, &WEIRDNET);
+        let presented = probe.get(from).cloned();
+        let reply = match probe.check_caller(&WEIRDNET, &key, from, presented.as_ref()) {
+            CallerCheck::Linked | CallerCheck::NotAdmitted => {
+                self.absorb(r.certs, r.epoch, r.chain, r.grants);
+                self.roster_msg()
+            }
+            other => Message::Refuse(Refuse::new(other.reason().unwrap_or("wrong-user"))),
+        };
+        Envelope::clear(&env.typ, env.epoch, &reply)
     }
 
     fn on_hello(&mut self, _from: &str, h: Hello, at_head: bool) -> Message {
@@ -276,7 +418,14 @@ impl SyncState {
         // Every cert, not only the revoked ones: a device linked here (no revocation, no
         // rotation, so no epoch change) must reach a puller that has never seen it.
         let revocations = self.roster.certs.clone();
-        Message::HelloOk(HelloOk { cert: self.our_cert.clone(), epoch: self.roster.epoch, cursors, revocations, chain: self.roster.chain.shared() })
+        Message::HelloOk(HelloOk {
+            cert: self.our_cert.clone(),
+            epoch: self.roster.epoch,
+            cursors,
+            revocations,
+            chain: self.roster.chain.shared(),
+            grants: self.roster.grants.clone(),
+        })
     }
 
     fn on_pull(&self, p: Pull) -> Message {
@@ -302,6 +451,44 @@ impl SyncState {
         let hlc = Hlc::tick(self.clock.as_ref(), now_ms, self.our_node.clone());
         self.clock = Some(hlc.clone());
         hlc
+    }
+}
+
+/// What a service link carries for sync, besides the node's certificate (which the
+/// link mints): the linking device's roster, the node's service [`DeviceGrant`] and, for
+/// a grant with sync types, the epoch keys (secret; zeroized on drop, never shown by
+/// `Debug`). The link channel is already authenticated and encrypted (SAS-checked), so
+/// the keys need no further sealing. Made by [`SyncState::service_bundle`], taken by
+/// [`SyncState::new_service`]; `weirdnet-device-link` carries it as opaque bytes.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LinkBundle {
+    pub roster: Roster,
+    pub grant: DeviceGrant,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "crate::bytes::option")]
+    pub keys: Option<Vec<u8>>,
+}
+
+impl LinkBundle {
+    pub fn to_bytes(&self) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        Ok(zeroize::Zeroizing::new(encode(self)?))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        decode(bytes)
+    }
+}
+
+impl Drop for LinkBundle {
+    fn drop(&mut self) {
+        if let Some(k) = self.keys.as_mut() {
+            k.zeroize();
+        }
+    }
+}
+
+impl std::fmt::Debug for LinkBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkBundle").field("grant", &self.grant).field("keys", &self.keys.is_some()).finish_non_exhaustive()
     }
 }
 
@@ -437,6 +624,18 @@ fn pull_session(
     applied: &mut usize,
 ) -> Result<()> {
     let from = node.peer_id().to_string();
+    // A roster-only device (this one or the peer) has no data keys: swap rosters, unsealed.
+    if state.key_status() == KeyStatus::RosterOnly || !state.roster.holds_keys(&peer.to_string()) {
+        return roster_exchange(state, node, peer, addrs, typ_name);
+    }
+    // A service device without the head key: catch up on the roster first (it may carry
+    // a rotation sealed to us).
+    if state.is_service() && state.current_key().id.is_none() {
+        roster_exchange(state, node, peer, addrs, typ_name)?;
+        if state.current_key().id.is_none() {
+            return Err(SyncError::Refused("needs-admission".into()));
+        }
+    }
     let mut catch_ups = 0;
     let mut pushed = false;
     let ok = loop {
@@ -452,12 +651,13 @@ fn pull_session(
         });
         let env = state.seal_envelope(&key, typ_name, &from, &hello)?;
         let reply = request(node, peer, addrs, &env)?;
+        let clear = reply.clear;
         match state.open_envelope(&reply, &from)? {
             Message::HelloOk(ok) => break ok,
             // We are behind a revocation or rotation: take the peer's signed roster and
             // chain, then hello again.
             Message::Roster(r) if catch_ups < 3 => {
-                state.absorb(r.certs, r.epoch, r.chain);
+                state.absorb(r.certs, r.epoch, r.chain, r.grants);
                 if !state.roster.get(&state.our_cert.peer_id).is_none_or(|c| c.active()) {
                     return Err(SyncError::Refused("revoked".into()));
                 }
@@ -467,12 +667,18 @@ fn pull_session(
                 }
                 catch_ups += 1;
             }
-            // The peer missed a rotation we hold: hand it our roster under the seed key
-            // (the chain is public; the epoch keys inside are sealed), then hello again.
+            // The peer missed a rotation we hold: hand it our roster (the chain is public;
+            // the epoch keys inside are sealed), then hello again. Under the seed key as
+            // through 0.6, or unsealed to a peer that refused unsealed (a service device)
+            // or from one (we have no seed).
             Message::Refuse(r) if r.reason == "unknown-key" && !pushed => {
-                let env = state.seal_envelope(&KeyRef::seed(state.roster.epoch), typ_name, &from, &state.roster_msg())?;
+                let env = if clear || state.is_service() {
+                    Envelope::clear(typ_name, state.roster.epoch, &state.roster_msg())?
+                } else {
+                    state.seal_envelope(&KeyRef::seed(state.roster.epoch), typ_name, &from, &state.roster_msg())?
+                };
                 if let Ok(Message::Roster(back)) = request(node, peer, addrs, &env).and_then(|e| state.open_envelope(&e, &from)) {
-                    state.absorb(back.certs, back.epoch, back.chain);
+                    state.absorb(back.certs, back.epoch, back.chain, back.grants);
                 }
                 pushed = true;
             }
@@ -483,8 +689,9 @@ fn pull_session(
     // The peer missed a revocation we hold, or lacks a cert we hold (a device linked or
     // revoked here). A peer before 0.5.2 lists only revoked certs, so it gets the roster
     // on every pass: one small extra request.
-    let behind = ok.epoch < state.roster.epoch || peer_lacks_certs(&state.roster, &ok.revocations, &ok.cert);
-    state.absorb(ok.revocations.into_iter().chain([ok.cert]).collect(), ok.epoch, ok.chain);
+    let behind =
+        ok.epoch < state.roster.epoch || peer_lacks_certs(&state.roster, &ok.revocations, &ok.cert) || peer_lacks_grants(&state.roster, &ok.grants);
+    state.absorb(ok.revocations.into_iter().chain([ok.cert]).collect(), ok.epoch, ok.chain, ok.grants);
     let key = state.current_key();
     if behind {
         // Hand the peer our roster so it can catch up.
@@ -512,6 +719,35 @@ fn pull_session(
         // on a device without a node key): replace it.
         state.rotate(now_ms() as i64)?;
     }
+    Ok(())
+}
+
+/// Whether the peer's HelloOk lacks a grant we hold, or holds an older one. (A peer
+/// before 0.7 sends none; it gets the roster on every pass while we hold grants.)
+fn peer_lacks_grants(ours: &Roster, theirs: &[DeviceGrant]) -> bool {
+    ours.grants.iter().any(|g| !theirs.iter().any(|t| t.peer_id == g.peer_id && t.issued_at >= g.issued_at))
+}
+
+/// Swap rosters with `peer`, unsealed (see [`Envelope::clear`]): how a roster-only device
+/// keeps up with certs, revocations, grants and rotations, and how any device brings one
+/// up to date.
+fn roster_exchange(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: PeerId, addrs: &[Multiaddr], typ_name: &str) -> Result<()> {
+    let env = Envelope::clear(typ_name, state.roster.epoch, &state.roster_msg())?;
+    let reply = request(node, peer, addrs, &env)?;
+    match reply.open_clear() {
+        Ok(Message::Roster(r)) => state.absorb(r.certs, r.epoch, r.chain, r.grants),
+        Ok(Message::Refuse(r)) => return Err(SyncError::Refused(r.reason)),
+        Ok(_) => return Err(SyncError::Protocol("expected a roster".into())),
+        // A peer before 0.7 answers under the seed key, which only a seed holder opens.
+        Err(_) => match state.open_envelope(&reply, &node.peer_id().to_string()) {
+            Ok(Message::Refuse(r)) => return Err(SyncError::Refused(r.reason)),
+            _ => return Err(SyncError::Refused("peer-too-old".into())),
+        },
+    }
+    if !state.roster.get(&state.our_cert.peer_id).is_none_or(|c| c.active()) {
+        return Err(SyncError::Refused("revoked".into()));
+    }
+    observe(state, now_ms());
     Ok(())
 }
 
@@ -632,7 +868,7 @@ mod tests {
         roster.upsert(cert.clone());
         let node = NodeId(peer.clone());
         let st = SyncState {
-            seed: SEED.to_vec(),
+            seed: Some(SEED.to_vec()),
             user_id: uid.into(),
             user_key: user.public(),
             our_cert: cert,
@@ -875,7 +1111,7 @@ mod tests {
         }
         let cs = c.0.lock().unwrap();
         assert!(cs.open_envelope(&page_env, &peer(b)).is_err(), "c holds the seed and every old key, and still cannot open it");
-        assert!(page_env.open(&cs.seed, &cs.user_id, &peer(b)).is_err());
+        assert!(page_env.open(cs.seed.as_ref().unwrap(), &cs.user_id, &peer(b)).is_err());
         // Nor can it pull with the seed-derived key, as itself or claiming to be B.
         for (from, label) in [(peer(c), "as c"), (peer(b), "as b")] {
             let pull = Message::Pull(Pull { node_id: a_node.clone(), after_seq: 0, typ: typ::BOOKMARKS.into(), limit: 10 });
@@ -1063,8 +1299,12 @@ mod tests {
         {
             let mut m = ms.lock().unwrap();
             let r = a.0.lock().unwrap().roster.clone();
-            let mut plain =
-                Roster { epoch: r.epoch, certs: r.certs.clone(), chain: KeyChain { devices: r.chain.devices.clone(), ..Default::default() } };
+            let mut plain = Roster {
+                epoch: r.epoch,
+                certs: r.certs.clone(),
+                chain: KeyChain { devices: r.chain.devices.clone(), ..Default::default() },
+                grants: vec![],
+            };
             plain.certs.retain(|x| x.active());
             let key = m.user_key.clone();
             m.roster.merge(&plain, &key, &WEIRDNET);

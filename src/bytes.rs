@@ -29,3 +29,30 @@ pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error>
     }
     d.deserialize_byte_buf(V)
 }
+
+/// `Option<Vec<u8>>` as an optional CBOR byte string.
+pub mod option {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(b) => s.serialize_some(&Wrap(b)),
+            None => s.serialize_none(),
+        }
+    }
+
+    struct Wrap<'a>(&'a [u8]);
+
+    impl serde::Serialize for Wrap<'_> {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            super::serialize(self.0, s)
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct Owned(#[serde(with = "super")] Vec<u8>);
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        Ok(Option::<Owned>::deserialize(d)?.map(|o| o.0))
+    }
+}

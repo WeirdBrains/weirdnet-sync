@@ -17,6 +17,10 @@ pub enum SyncError {
     /// An [`crate::identity::Identity`] that can't be created, adopted or opened as asked.
     #[error("{0}")]
     Identity(String),
+    /// Something only a device holding the identity seed may do (admit, revoke, grant,
+    /// rotate), asked of a service device linked without it.
+    #[error("not permitted on a service device: {0}")]
+    NotPermitted(String),
 }
 
 impl From<weirdnet_keys::KeysError> for SyncError {

@@ -339,8 +339,22 @@ impl Roster {
     fn signed_parts(&self) -> (Vec<Ided<'_, Rotation>>, Vec<Ided<'_, Admission>>) {
         let active = self.active_set();
         let known: BTreeSet<&str> = self.certs.iter().map(|c| c.peer_id.as_str()).collect();
-        let rots = self.chain.rotations.iter().filter(|r| known.contains(r.by.as_str()) && r.signed()).map(|r| (r.id(), r)).collect();
-        let adms = self.chain.admissions.iter().filter(|a| active.contains(a.by.as_str()) && a.signed()).map(|a| (a.id(), a)).collect();
+        // What a service device signs once it is one does not count: it may not rotate or admit.
+        let by_service = |by: &str, at: i64| self.service_since(by).is_some_and(|t| at >= t);
+        let rots = self
+            .chain
+            .rotations
+            .iter()
+            .filter(|r| known.contains(r.by.as_str()) && !by_service(&r.by, r.at_ms) && r.signed())
+            .map(|r| (r.id(), r))
+            .collect();
+        let adms = self
+            .chain
+            .admissions
+            .iter()
+            .filter(|a| active.contains(a.by.as_str()) && !by_service(&a.by, a.at_ms) && a.signed())
+            .map(|a| (a.id(), a))
+            .collect();
         (rots, adms)
     }
 
@@ -584,6 +598,9 @@ pub enum KeyStatus {
     NeedsAdmission,
     /// This device has been revoked.
     Revoked,
+    /// A service device linked without data keys (a roster-only grant): it syncs the
+    /// roster and nothing else, and never needs admission.
+    RosterOnly,
 }
 
 impl SyncState {
@@ -601,6 +618,9 @@ impl SyncState {
         if self.roster.get(&self.our_cert.peer_id).is_some_and(|c| !c.active()) || !self.our_cert.active() {
             return KeyStatus::Revoked;
         }
+        if !self.roster.holds_keys(&self.our_cert.peer_id) {
+            return KeyStatus::RosterOnly;
+        }
         let view = self.roster.chain_view();
         match view.head() {
             None => KeyStatus::Seed,
@@ -616,8 +636,13 @@ impl SyncState {
     /// Active devices that have not published a device key yet (not upgraded, or not
     /// synced since). A rotation now leaves them out; they would need re-admission.
     /// Apps warn before revoking while this is not empty.
+    /// Roster-only service devices never need one and are not listed.
     pub fn devices_without_key(&self) -> Vec<NodeCert> {
-        self.roster.active().filter(|c| self.roster.chain.device(&c.peer_id).is_none_or(|d| !d.verify())).cloned().collect()
+        self.roster
+            .active()
+            .filter(|c| self.roster.holds_keys(&c.peer_id) && self.roster.chain.device(&c.peer_id).is_none_or(|d| !d.verify()))
+            .cloned()
+            .collect()
     }
 
     /// The first rotation should happen now, on this device: there is no rotation yet,
@@ -629,10 +654,11 @@ impl SyncState {
     /// [`SyncState::rotate_if_first_due`].
     pub fn first_rotation_due(&self) -> bool {
         let Some(device) = &self.device else { return false };
-        if self.key_status() != KeyStatus::Seed {
+        if self.is_service() || self.key_status() != KeyStatus::Seed {
             return false;
         }
-        let active: Vec<&NodeCert> = self.roster.active().collect();
+        // Only devices that may rotate take part in choosing who starts the chain.
+        let active: Vec<&NodeCert> = self.roster.active().filter(|c| !self.roster.is_service(&c.peer_id)).collect();
         let me = device.peer_id();
         active.len() >= 2 && active.iter().any(|c| c.peer_id == me) && self.devices_without_key().is_empty() && active.iter().all(|c| c.peer_id >= me)
     }
@@ -645,7 +671,11 @@ impl SyncState {
     /// The head has a revoked member and this device can replace it.
     pub fn needs_rotation(&self) -> bool {
         let view = self.roster.chain_view();
-        self.device.is_some() && view.dirty() && view.head().is_some_and(|h| self.keys.has(&h.id)) && self.key_status() != KeyStatus::Revoked
+        self.device.is_some()
+            && !self.is_service()
+            && view.dirty()
+            && view.head().is_some_and(|h| self.keys.has(&h.id))
+            && self.key_status() != KeyStatus::Revoked
     }
 
     /// Open every key sealed or admitted to this device and adopt the root. Returns how
@@ -703,6 +733,9 @@ impl SyncState {
     /// Rotate on top of `view`'s head (taken before a revocation, whose creator's
     /// rotations would otherwise drop out of the view until someone builds on them).
     fn rotate_on(&mut self, view: &ChainView, at_ms: i64) -> Result<String> {
+        if self.is_service() {
+            return Err(SyncError::NotPermitted("rotate".into()));
+        }
         let device = self.device.clone().ok_or_else(|| SyncError::Protocol("no device key".into()))?;
         let me = device.peer_id();
         self.publish_device_key(at_ms)?;
@@ -716,6 +749,10 @@ impl SyncState {
             None => (None, self.roster.epoch.saturating_add(1), active.clone()),
         };
         candidates.extend(self.roster.chain.approved.iter().cloned());
+        // Service devices with sync types got their keys at link time, not as members of a
+        // rotation: keep them in. Roster-only ones never get a key.
+        candidates.extend(self.roster.active().filter(|c| self.roster.is_service(&c.peer_id)).map(|c| c.peer_id.clone()));
+        candidates.retain(|p| self.roster.holds_keys(p));
         let key = Key32::random()?;
         let eph = ExchangeSecret::generate();
         let mut r = Rotation {
@@ -751,6 +788,9 @@ impl SyncState {
     /// Revoke a device and, when this state has a device key, rotate so the revoked
     /// device cannot read anything written afterwards even though it holds the seed.
     pub fn revoke(&mut self, user: &Keypair, peer_id: &str, at_ms: i64) -> Result<NodeCert> {
+        if self.is_service() {
+            return Err(SyncError::NotPermitted("revoke".into()));
+        }
         let before = self.roster.chain_view();
         let cert = self.roster.revoke(&WEIRDNET, user, peer_id, at_ms)?;
         if self.device.is_some() {
@@ -763,6 +803,9 @@ impl SyncState {
     /// its device key is known, otherwise as soon as one of its hellos brings the key.
     /// Returns whether it was admitted now.
     pub fn approve(&mut self, cert: NodeCert, at_ms: i64) -> Result<bool> {
+        if self.is_service() {
+            return Err(SyncError::NotPermitted("approve".into()));
+        }
         if !WEIRDNET.verify_cert(&self.user_key, &cert) || !cert.active() || cert.user_id != self.user_id {
             return Err(SyncError::Refused("wrong-user".into()));
         }
@@ -771,6 +814,10 @@ impl SyncState {
         }
         let peer = cert.peer_id.clone();
         self.roster.upsert(cert);
+        if !self.roster.holds_keys(&peer) {
+            // A roster-only service device: in the roster, never in the key chain.
+            return Ok(false);
+        }
         if !self.roster.chain.approved.contains(&peer) {
             self.roster.chain.approved.push(peer.clone());
         }
@@ -783,9 +830,12 @@ impl SyncState {
     /// revoked devices leave the list. Returns the devices admitted.
     pub fn admit_approved(&mut self, at_ms: i64) -> Vec<String> {
         let mut admitted = Vec::new();
-        if self.roster.chain.approved.is_empty() || self.device.is_none() {
+        if self.roster.chain.approved.is_empty() || self.device.is_none() || self.is_service() {
             return admitted;
         }
+        let roster = &self.roster;
+        let drop: Vec<String> = roster.chain.approved.iter().filter(|p| !roster.holds_keys(p)).cloned().collect();
+        self.roster.chain.approved.retain(|p| !drop.contains(p));
         for peer in self.roster.chain.approved.clone() {
             let active = self.roster.get(&peer).is_some_and(|c| c.active());
             let mut done = active;
@@ -836,6 +886,12 @@ impl SyncState {
     }
 
     fn admit_to(&mut self, cert: NodeCert, view: &ChainView, at_ms: i64) -> Result<bool> {
+        if self.is_service() {
+            return Err(SyncError::NotPermitted("admit".into()));
+        }
+        if !self.roster.holds_keys(&cert.peer_id) {
+            return Ok(false);
+        }
         let device = self.device.clone().ok_or_else(|| SyncError::Protocol("no device key".into()))?;
         let peer = cert.peer_id.clone();
         let Some(head) = view.head() else { return Ok(false) };
