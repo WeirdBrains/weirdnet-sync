@@ -10,7 +10,7 @@ Not audited. Sealing and HKDF go through `weirdnet-keys` only (XChaCha20-Poly130
 - Every device can still sign with the user key. A revoked device can therefore certify new nodes and sign revocations of other devices (denial of service), but a new node gets no epoch key without an admission from a member, which the app must only make after the user approves it on a member device.
 - Before the first rotation, all seed holders are equal. A device that has not yet synced the first rotation can be offered a rival root by a revoked seed holder. Rotating once while every device is trusted (for example right after linking) closes that window.
 - Epoch keys (`EpochKeys`) are secret, zeroized on drop, and redacted from `Debug`. Store them encrypted.
-- The official WeirdBrains relay must not store sealed pages. This crate does not write pages to a relay.
+- The official [WeirdBrains](https://weirdbrains.com) relay must not store sealed pages. This crate does not write pages to a relay.
 
 ## Service devices (0.7)
 
