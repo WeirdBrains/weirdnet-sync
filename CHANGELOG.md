@@ -6,6 +6,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-19
+
 ### Fixed
 
 - A device linked on one device (no revocation or rotation, so no epoch change) now reaches the others in one pass. `HelloOk` lists every cert the answering node holds, not only the revoked ones (the field keeps its wire name `revocations`), and a puller whose peer lacks one of its certs sends it the roster. Before, a new cert spread only by luck of which device started the first rotation, so a pass could end without error and the new device stay unknown. Wire-compatible both ways: older nodes merge the extra certs as before, and a puller hands an older peer its roster on each pass (one small request).
@@ -93,7 +95,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 - HLC, op log, LWW registers, OR-sets, tombstone GC, SyncKey page sealing, roster / self-cert / revocation, and the `weirdnet-sync/v1` protocol over `weirdnet-net` 0.6.0.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.3.1...v0.4.0
