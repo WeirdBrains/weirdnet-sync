@@ -6,7 +6,7 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
-Planned as 0.8.0 (breaking: `SyncState` gains a `voter` field, `Message` gains lease variants).
+Releases as 0.8.0 (breaking: `SyncState` gains a `voter` field, `Message` gains lease variants).
 
 ### Added
 
@@ -14,6 +14,12 @@ Planned as 0.8.0 (breaking: `SyncState` gains a `voter` field, `Message` gains l
 - `plan`: signed, versioned plans ordered by `(term, version)` (`SyncState::publish_plan`, `current_plan`, `current_plan_where`).
 - `jobs`: a job log with per-job claim leases, checkpoints, results, retries and re-claims (`Jobs`, `JobSpec`, `JobEvent`, `JobView`, `JobStatus`, `job_lease`, `Leases::claim_job`).
 - `Identity::enable_voter`, `enable_voter_with`, `disable_voter` (terms kept in `voter.cbor`).
+
+### Changed
+
+- `SyncState` has a public `voter` field: code that builds `SyncState` with a struct literal adds `voter: None`.
+- `Message` has `LeaseAsk`, `LeaseGrant`, `LeaseDeny` and `LeaseFree`: exhaustive matches need arms for them.
+- Lease voters need 0.8 on every voting device; pulls between 0.7 and 0.8 devices are unchanged.
 
 ## [0.7.0] - 2026-11-20
 

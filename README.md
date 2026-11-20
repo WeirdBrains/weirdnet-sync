@@ -87,7 +87,7 @@ A server (a model or inference node) can join with a certificate only, never the
 - Its secrets (`node.key`, `keys`) go through a `SecretStore` (0600 files by default, `FileSecrets`; pass an OS keystore with the `*_with` constructors).
 - A service device needs a 0.7 peer: a 0.6 device cannot open unsealed messages.
 
-## Leases, plans and jobs (unreleased, 0.8)
+## Leases, plans and jobs (0.8)
 
 The op log is eventually consistent, so it can't give mutual exclusion. For "one device decides" (a scheduler) and "one device works on this job", 0.8 adds a majority-vote lease with fencing terms, and two kinds of records ordered by term instead of clock.
 
@@ -124,5 +124,5 @@ A pull applies and acks page by page, so when a later page is refused (or the ne
 
 ## Status
 
-Published on crates.io; the current release is 0.7.0 (main adds leases, plans and jobs for the next minor release). 0.7.0 added service devices linked without the seed, user-signed device grants (roles) and a pluggable secret store; `SyncState::seed` is now an `Option`. 0.6.0 added the shared identity store (`Identity`) and made `SyncError` non-exhaustive. 0.5.2 fixed a device linked on one device not reaching the others in one pass; 0.5 moved to weirdnet-net 0.8 (protocol `/weirdnet/sync/2`, larger pages) and added `SyncState::snapshot`/`merge_back` and `pull_from_shared`. Large and sealed records shipped in 0.4, key rotation on revoke in 0.3.
-See `CHANGELOG.md`.
+Published on crates.io; the current release is 0.8.0, which added majority-vote leases with fencing terms, signed plans and a job log with per-job claims; `SyncState` has a `voter` field and `Message` has lease variants. 0.7.0 added service devices linked without the seed, user-signed device grants (roles) and a pluggable secret store; `SyncState::seed` is now an `Option`. 0.6.0 added the shared identity store (`Identity`) and made `SyncError` non-exhaustive. 0.5.2 fixed a device linked on one device not reaching the others in one pass; 0.5 moved to weirdnet-net 0.8 (protocol `/weirdnet/sync/2`, larger pages) and added `SyncState::snapshot`/`merge_back` and `pull_from_shared`. Large and sealed records shipped in 0.4, key rotation on revoke in 0.3.
+See [CHANGELOG.md](CHANGELOG.md).

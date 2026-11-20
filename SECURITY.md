@@ -22,7 +22,7 @@ A service device holds its node key, its certificate, a user-signed grant and, o
 - Rosters and refusals to and from service devices travel unsealed over the Noise-authenticated stream. The roster is public within the user's devices (every part verifies under the user key); an unsealed roster is only answered to an active device of the user.
 - Seed copies a device held before being re-linked as a service device are not made safe by re-linking; treat old images and backups as holding the identity.
 
-## Leases (unreleased, 0.8)
+## Leases (0.8)
 
 - Safety rests on majority intersection and on each side's monotonic clock: a holder stops at `asked_at + duration × (1 − max_drift) − 50 ms`, before any voter's promise ends, as long as clock-rate drift stays under `max_drift`. Wall clocks and HLC play no part; plans and job claims are ordered by term.
 - A voter writes each new term before granting it (with `Identity::enable_voter` or `Voter::with_persist`). Without persistence a crash can repeat a term. After a restart it refuses takeovers for one lease duration.
