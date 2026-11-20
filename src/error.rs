@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SyncError {
     #[error("{0}")]
     Crypto(String),
@@ -10,6 +11,12 @@ pub enum SyncError {
     Codec(String),
     #[error("{0}")]
     Protocol(String),
+    /// Reading or writing an [`crate::identity::Identity`]'s files.
+    #[error("{0}")]
+    Io(String),
+    /// An [`crate::identity::Identity`] that can't be created, adopted or opened as asked.
+    #[error("{0}")]
+    Identity(String),
 }
 
 impl From<weirdnet_keys::KeysError> for SyncError {

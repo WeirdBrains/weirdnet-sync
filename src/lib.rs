@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod hlc;
+pub mod identity;
 pub mod log;
 pub mod merge;
 pub mod net;
@@ -20,6 +21,7 @@ mod error;
 
 pub use error::{Result, SyncError};
 pub use hlc::{Hlc, NodeId};
+pub use identity::{Identity, LinkSettings, Tick};
 pub use log::{LogEntry, OpLog, Page as LogPage};
 pub use merge::{CONFLICT_KEEP_MS, Lww, OrSet, TOMBSTONE_GC_MS, can_gc_tombstone, edit_vs_delete, folder_cycle, lww};
 pub use net::{

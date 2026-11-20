@@ -6,6 +6,14 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `identity::Identity` (re-exported with `LinkSettings` and `Tick`): the on-disk identity store apps with linked devices share (seed, node key and cert, epoch keys, roster), parameterised on the sync type. `create`, `adopt` (a device link), `open`, `approve`, `revoke`, `link_settings`, `roster_view`, and `tick`, a `pull_from_shared` pass against every linked device that reports devices reached, entries applied and per-device errors. Same files as Ymir's `membership` and Bragi's `identity`, which it replaces.
+
+### Changed
+
+- `SyncError` is `#[non_exhaustive]` and has `Io` and `Identity` variants (breaking for exhaustive matches).
+
 ## [0.5.2] - 2026-11-19
 
 ### Fixed

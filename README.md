@@ -57,6 +57,24 @@ A value larger than `Limits::inline_max` (after sealing) is split into `Limits::
 - Members keep older epoch keys and admitted devices receive them, so values sealed before a rotation stay readable. `SyncState::reseal_stale` re-seals the latest value of each record still under an older key; it is optional and is a new write of the same value, so run it after syncing. A revoked device keeps whatever it could read before; change the secret itself when that matters.
 - `read` refuses an unsealed entry in a sealed type, so a seed holder cannot write around the seal. The fallback is never sealed.
 
+## Identity store
+
+`identity::Identity` (since 0.6) is the on-disk identity every app with linked devices needs: the user key seed, this node's key and certificate, the epoch keys and the roster, in one directory (0700; secrets in 0600 files, plain, not keystore-sealed). It is parameterised on the one sync type the app announces (`ymir.pool`, `bragi.app`, …).
+
+```rust
+use weirdnet_sync::Identity;
+
+let me = match Identity::open(&dir, "myapp.app")? {
+    Some(me) => me,
+    None => Identity::create(&dir, "my laptop", "myapp.app")?,   // or Identity::adopt(...) after a device link
+};
+let handler_state = me.state();               // for start_node / SyncHandler
+me.approve(new_device_cert)?;                 // linked from here
+let tick = me.tick(&node, &|cert| addrs_for(cert))?;   // one pass against every linked device
+```
+
+`create` never overwrites an identity. `adopt` takes what a device link delivers (seed, the cert the existing device made for this node, and the `LinkSettings` JSON with its roster) and checks the cert is for this node and user. `tick` pulls with `pull_from_shared`, so devices linked or revoked elsewhere arrive even when the type carries no records; it returns the devices reached, entries applied and per-device errors, and saves. `link_settings`, `seed`, `revoke` (rotates keys; never this node's own cert) and `roster_view` cover the rest. The file layout is the one Ymir's `membership` and Bragi's `identity` modules used, so their stores open unchanged.
+
 ## Protocol
 
 `/weirdnet/sync/2`, length-prefixed CBOR, one request/reply at a time (the same style as `/weirdnet/link/1`). After the authenticated channel is up, payloads that carry records, cursors or certificates are sealed. Messages: `Hello` / `HelloOk` or `Refuse`, `Pull`, `Page`, `Ack`, `Roster`.
