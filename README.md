@@ -101,10 +101,5 @@ A pull applies and acks page by page, so when a later page is refused (or the ne
 
 ## Status
 
-Published on crates.io; the current release is 0.4.0. It adds large records (values over
-`Limits::inline_max` are split into BLAKE3-checked chunks) and sealed records (per-record keys
-from the head epoch key, so a device revoked before a write cannot read it), budgets pages so a
-full page fits the 256 KiB reply cap, adds `Roster::check_caller`, and moves to weirdnet-net 0.7. The next release moves to weirdnet-net 0.8 (protocol `/weirdnet/sync/2`, larger pages).
-Peers on 0.3 keep working and see the fallback value. Key rotation on revoke shipped in 0.3.0,
-with two fixes in 0.3.1.
+Published on crates.io; the current release is 0.6.0. It adds the shared identity store (`Identity`) and makes `SyncError` non-exhaustive. 0.5.2 fixed a device linked on one device not reaching the others in one pass; 0.5 moved to weirdnet-net 0.8 (protocol `/weirdnet/sync/2`, larger pages) and added `SyncState::snapshot`/`merge_back` and `pull_from_shared`. Large and sealed records shipped in 0.4, key rotation on revoke in 0.3.
 See `CHANGELOG.md`.
