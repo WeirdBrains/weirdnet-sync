@@ -6,6 +6,12 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-21
+
+### Changed
+
+- Package metadata and docs follow the WeirdBrains public-content rules (Weird Brains LLC as the copyright holder, m3talsmith as the author, no machine details). No code or API changes.
+
 ## [0.5.2] - 2026-11-19
 
 ### Fixed
@@ -96,6 +102,7 @@ All notable changes to weirdnet-sync are listed here. The format follows
 - HLC, op log, LWW registers, OR-sets, tombstone GC, SyncKey page sealing, roster / self-cert / revocation, and the `weirdnet-sync/v1` protocol over `weirdnet-net` 0.6.0.
 
 [Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.2...HEAD
+[0.5.3]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.4.0...v0.5.0
