@@ -26,7 +26,7 @@ The epoch keys a device holds are in `SyncState::keys` (`EpochKeys`). They are s
 
 This is not [`Profile::sync_key`](https://docs.rs/weirdnet-net): that derives one key from the Ed25519 secret with info `weirdnet/sync/v1/key`. Typed library pages use this crate.
 
-The official WeirdBrains relay must not store sealed pages. Only a user-run node may keep them for catch-up, and that is an application choice, not something this crate enables on a relay.
+The official [WeirdBrains](https://weirdbrains.com) relay must not store sealed pages. Only a user-run node may keep them for catch-up, and that is an application choice, not something this crate enables on a relay.
 
 ## Large and sealed records
 
