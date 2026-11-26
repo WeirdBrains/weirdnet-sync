@@ -6,6 +6,14 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A service device granted a sealed record type (for example `ymir.context`) can read and write its records again: they are sealed under a type-scoped record key while an active service device is granted the type, and with the epoch key otherwise, so older devices keep reading records no service device shares. `reseal_stale` moves existing records to the right key.
+
+### Added
+
+- `SyncState::seals_scoped`, `Roster::service_granted`, `scoped_record_key`, `scoped_record_aad`, `seal_record_scoped`, `open_record_scoped`.
+
 ## [0.8.3] - 2026-11-26
 
 ### Security
