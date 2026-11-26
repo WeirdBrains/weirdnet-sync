@@ -464,6 +464,15 @@ fn fold(evs: Vec<(JobEvent, String, Hlc)>, has_role: RoleCheck, is_service: Serv
                 }
             }
             JobEvent::Paused { term: None } if owner_op(signer) => {
+                // The owner's pause ends the attempt in progress without counting it, whether
+                // or not its holder gets its own pause into the log before its lease runs out
+                // (voters stop renewing a paused job's claim).
+                if let Some((_, t)) = &claim {
+                    let ended = finished.as_ref().is_some_and(|f| f.0 == *t) || failed.as_ref().is_some_and(|f| f.0 == *t);
+                    if !ended && !holder_paused.contains(t) {
+                        holder_paused.push(*t);
+                    }
+                }
                 paused = Some(true);
                 paused_at = hlc.clone();
             }
@@ -801,7 +810,8 @@ mod tests {
         e.push((JobEvent::Cancelled, "svc", 4));
         assert_eq!(fold_r(evs(e.clone())).unwrap().status, JobStatus::Claimed, "a service device is not the owner");
         e.push((JobEvent::Paused { term: None }, "a", 5));
-        assert_eq!(fold_r(evs(e.clone())).unwrap().status, JobStatus::Paused);
+        let v = fold_r(evs(e.clone())).unwrap();
+        assert_eq!((v.status, v.attempts), (JobStatus::Paused, 0), "the owner's pause doesn't use an attempt");
         // The holder stops and lets go; its claim is not an attempt.
         e.push((JobEvent::Paused { term: Some(Term(1)) }, "b", 6));
         e.push((JobEvent::Resumed, "a", 7));
@@ -809,6 +819,23 @@ mod tests {
         assert_eq!((v.status, v.attempts), (JobStatus::Open, 0));
         e.push((JobEvent::Cancelled, "a", 8));
         assert_eq!(fold_r(evs(e)).unwrap().status, JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn an_owner_pause_spares_only_the_attempt_in_progress() {
+        let mut e = vec![
+            (JobEvent::Posted(ruled()), "a", 1),
+            (JobEvent::Claimed { term: Term(1), by: "a".into() }, "a", 2),
+            (JobEvent::Failed { term: Term(1), reason: "oom".into(), retry: true }, "a", 3),
+            (JobEvent::Claimed { term: Term(2), by: "b".into() }, "b", 200),
+            // The holder's lease ran out before it could write its own pause.
+            (JobEvent::Paused { term: None }, "a", 300),
+        ];
+        let v = fold_r(evs(e.clone())).unwrap();
+        assert_eq!((v.status, v.attempts), (JobStatus::Paused, 1), "the failed attempt still counts");
+        e.push((JobEvent::Resumed, "a", 400));
+        e.push((JobEvent::Claimed { term: Term(3), by: "a".into() }, "a", 500));
+        assert_eq!(fold_r(evs(e)).unwrap().attempts, 2);
     }
 
     #[test]

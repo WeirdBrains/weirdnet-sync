@@ -6,6 +6,10 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- An owner's pause no longer counts the claim in progress as an attempt when its holder's lease runs out before the holder records its own pause (voters stop renewing a paused job's claim, so a busy holder could miss the window).
+
 ## [0.8.1] - 2026-11-25
 
 ### Added
