@@ -41,7 +41,10 @@ pub use protocol::{
     Ack, Cursors, Envelope, Hello, HelloOk, KeyRef, Message, PAGE_BUDGET, PAGE_MAX, PROTOCOL, Page, Pull, Refuse, RefuseReason, RosterMsg,
     SYNC_PROFILE, decode, decode_framed, encode, encode_framed,
 };
-pub use record::{Blob, Limits, RecordOptions, RecordRef, RecordValue, SealInfo, Value, chunk_type};
+pub use record::{
+    Blob, Limits, RecordOptions, RecordRef, RecordValue, SealInfo, Value, chunk_type, open_record_scoped, scoped_record_aad, scoped_record_key,
+    seal_record_scoped,
+};
 pub use roster::{CallerCheck, DeviceClass, DeviceGrant, MAX_GRANT_ROLES, MAX_GRANT_TYPES, Roster, SessionCheck, SessionOffer};
 pub use rotation::{Admission, ChainView, Device, DeviceKey, EpochKeys, KeyChain, KeyStatus, Rotation, SealedKey, ValidRotation};
 pub use seal::{SyncKey, SyncType, open_page, page_aad, page_aad_keyed, rotated_sync_key, seal_page, sync_key, sync_key_info};

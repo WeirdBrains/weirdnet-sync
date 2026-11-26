@@ -245,6 +245,13 @@ impl Roster {
         self.grant_of(peer_id)?.scoped_types()
     }
 
+    /// Whether an active service device is granted `typ` (since 0.8.4). Full devices then
+    /// seal `typ`'s records under the type-scoped record key so it can open them
+    /// ([`crate::SyncState::seals_scoped`]).
+    pub fn service_granted(&self, typ: &str) -> bool {
+        self.active().any(|c| self.grant_of(&c.peer_id).is_some_and(|g| g.class == DeviceClass::Service && g.types.iter().any(|t| t == typ)))
+    }
+
     /// Whether `peer_id` may sync `typ` with this device (since 0.8.3): every device may,
     /// except a service device, which may sync only the types in its grant (and their
     /// chunk types) plus [`LEASE_TYPE`](crate::lease::LEASE_TYPE), and nothing when its

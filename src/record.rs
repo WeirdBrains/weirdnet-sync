@@ -18,10 +18,21 @@
 //! receive them, so values sealed before a rotation stay readable;
 //! [`crate::SyncState::reseal_stale`] moves them to the head key. Sealing happens before
 //! chunking, so chunks of a sealed value are ciphertext.
+//!
+//! Since 0.8.4 a value may instead be sealed under a key derived from the type's
+//! [`SyncKey`] under the head rotation ([`scoped_record_key`]), which a
+//! service device granted the type holds ([`crate::EpochKeys::get_scoped`]) without any
+//! epoch key. The rule ([`crate::SyncState::seals_scoped`]): a service device always seals
+//! type-scoped; a full device seals type-scoped while an active service device is granted
+//! the type ([`crate::Roster::service_granted`]) and with the epoch key otherwise, so 0.7.1
+//! to 0.8.3 devices keep reading what it writes when no service device shares the type.
+//! Readers try both keys, so no marker goes on the wire. A service device revoked before a
+//! rotation gets no scoped key for it and cannot open what is sealed under it.
 use crate::error::{Result, SyncError};
 use crate::log::{LogEntry, OpLog};
 use crate::protocol::{KeyRef, PAGE_BUDGET};
 use crate::rotation::KeyStatus;
+use crate::seal::SyncKey;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -86,7 +97,8 @@ impl Limits {
 /// How a record type is written: sealed or not, and its limits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecordOptions {
-    /// Seal every value under a per-record key from the head epoch key.
+    /// Seal every value under a per-record key from the head rotation (its epoch key, or
+    /// since 0.8.4 the type's scoped key; see [`crate::SyncState::seals_scoped`]).
     pub sealed: bool,
     pub limits: Limits,
 }
@@ -278,22 +290,32 @@ impl crate::net::SyncState {
     /// opened when sealed. `Pending` lists chunks still to pull. An entry of a sealed
     /// type that is not sealed is refused.
     pub fn read(&self, e: &LogEntry) -> Result<RecordValue> {
+        self.read_scheme(e).map(|(v, _)| v)
+    }
+
+    /// [`crate::SyncState::read`], plus whether a sealed value opened under the
+    /// type-scoped record key (`Some(true)`), the epoch key (`Some(false)`), or is not
+    /// sealed or not ready (`None`).
+    fn read_scheme(&self, e: &LogEntry) -> Result<(RecordValue, Option<bool>)> {
         let sealed_type = self.options(&e.typ).sealed;
         let Some(v) = &e.value else {
             if sealed_type {
                 return Err(SyncError::Protocol("unsealed entry in a sealed type".into()));
             }
-            return Ok(RecordValue::Ready(zeroize::Zeroizing::new(e.op.clone())));
+            return Ok((RecordValue::Ready(zeroize::Zeroizing::new(e.op.clone())), None));
         };
         if sealed_type && v.seal.is_none() {
             return Err(SyncError::Protocol("unsealed entry in a sealed type".into()));
         }
         match payload(&self.log, e, v)? {
             RecordValue::Ready(p) => match &v.seal {
-                Some(s) => Ok(RecordValue::Ready(self.open_payload(s, e, &p)?)),
-                None => Ok(RecordValue::Ready(p)),
+                Some(s) => {
+                    let (plain, scoped) = self.open_payload(s, e, &p)?;
+                    Ok((RecordValue::Ready(plain), Some(scoped)))
+                }
+                None => Ok((RecordValue::Ready(p), None)),
             },
-            pending => Ok(pending),
+            pending => Ok((pending, None)),
         }
     }
 }
@@ -341,7 +363,49 @@ pub fn open_record(epoch_key: &Key32, user_id: &str, r: &RecordRef<'_>, seal: &S
     Ok(weirdnet_keys::open(&key, &sealed, &record_aad(r, seal.epoch, &seal.key))?)
 }
 
+/// Per-record key under a type's [`SyncKey`] (since 0.8.4): `HKDF-SHA256(SyncKey(type)
+/// under rotation id, salt = user id,
+/// info = weirdnet-sync/v1/record-scoped/<type>/e<n>/k<rotation id>/<record id>)`.
+/// `type_key` is [`crate::rotated_sync_key`] of the rotation's epoch key on a full device,
+/// or the scoped key a service device holds ([`crate::EpochKeys::sync_key`] gives either).
+pub fn scoped_record_key(type_key: &SyncKey, user_id: &str, typ: &str, record_id: &str, epoch: u32, id: &str) -> Result<Key32> {
+    let info = format!("weirdnet-sync/v1/record-scoped/{typ}/e{epoch}/k{id}/{record_id}");
+    Ok(kdf::hkdf(&type_key.0, Some(user_id.as_bytes()), info.as_bytes())?)
+}
+
+/// Associated data of a record sealed under a type-scoped key (since 0.8.4): as
+/// [`record_aad`], under its own label.
+pub fn scoped_record_aad(r: &RecordRef<'_>, epoch: u32, id: &str) -> Vec<u8> {
+    format!("weirdnet-sync/v1/record-scoped|v{VALUE_VERSION}|{}|e{epoch}|k{id}|{}|{}", r.typ, r.node, r.record_id).into_bytes()
+}
+
+/// Seal `plain` for record `r` under rotation `id`'s type-scoped key (since 0.8.4).
+pub fn seal_record_scoped(type_key: &SyncKey, user_id: &str, r: &RecordRef<'_>, epoch: u32, id: &str, plain: &[u8]) -> Result<(SealInfo, Vec<u8>)> {
+    let key = scoped_record_key(type_key, user_id, r.typ, r.record_id, epoch, id)?;
+    let s = weirdnet_keys::seal(&key, plain, &scoped_record_aad(r, epoch, id))?;
+    let nonce = hex::decode(&s.nonce).map_err(|_| SyncError::Crypto("bad nonce".into()))?;
+    let ct = hex::decode(&s.ct).map_err(|_| SyncError::Crypto("bad ciphertext".into()))?;
+    Ok((SealInfo { epoch, key: id.to_string(), nonce }, ct))
+}
+
+/// Open a value sealed for record `r` under a type-scoped key (since 0.8.4).
+pub fn open_record_scoped(type_key: &SyncKey, user_id: &str, r: &RecordRef<'_>, seal: &SealInfo, ct: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let key = scoped_record_key(type_key, user_id, r.typ, r.record_id, seal.epoch, &seal.key)?;
+    let sealed = Sealed { nonce: hex::encode(&seal.nonce), ct: hex::encode(ct) };
+    Ok(weirdnet_keys::open(&key, &sealed, &scoped_record_aad(r, seal.epoch, &seal.key))?)
+}
+
 impl crate::net::SyncState {
+    /// Whether a sealed write of `typ` here uses the type-scoped record key
+    /// ([`seal_record_scoped`]) rather than the epoch key ([`seal_record`]) (since 0.8.4).
+    /// A service device always does (it holds no epoch key). A full device does while an
+    /// active service device is granted `typ` ([`crate::Roster::service_granted`]), so that
+    /// device can open it; otherwise it seals with the epoch key, as 0.7.1 to 0.8.3 do and
+    /// read. [`crate::SyncState::reseal_stale`] follows the same rule.
+    pub fn seals_scoped(&self, typ: &str) -> bool {
+        self.is_service() || self.roster.service_granted(typ)
+    }
+
     fn seal_payload<'a>(&self, opts: &RecordOptions, typ: &str, record_id: &str, value: &'a [u8]) -> Result<(Option<SealInfo>, Cow<'a, [u8]>)> {
         if !opts.sealed {
             return Ok((None, Cow::Borrowed(value)));
@@ -353,14 +417,40 @@ impl crate::net::SyncState {
             // Seed-derived keys are held by every seed holder, revoked or not: never seal under them.
             return Err(SyncError::Refused("no-epoch-key".into()));
         };
-        let key = self.keys.get(&id).ok_or_else(|| SyncError::Refused("no-epoch-key".into()))?;
-        let (seal, ct) = seal_record(key, &self.user_id, &RecordRef { typ, record_id, node: &self.our_node.0 }, epoch, &id, value)?;
+        let r = RecordRef { typ, record_id, node: &self.our_node.0 };
+        let (seal, ct) = if self.seals_scoped(typ) {
+            let k = self.keys.sync_key(&self.user_id, typ, epoch, &id).map_err(|_| SyncError::Refused("no-epoch-key".into()))?;
+            seal_record_scoped(&k, &self.user_id, &r, epoch, &id, value)?
+        } else {
+            let key = self.keys.get(&id).ok_or_else(|| SyncError::Refused("no-epoch-key".into()))?;
+            seal_record(key, &self.user_id, &r, epoch, &id, value)?
+        };
         Ok((Some(seal), Cow::Owned(ct)))
     }
 
-    fn open_payload(&self, s: &SealInfo, e: &LogEntry, ct: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        let key = self.keys.get(&s.key).ok_or_else(|| SyncError::Crypto("sealed under an epoch key this device does not hold".into()))?;
-        open_record(key, &self.user_id, &RecordRef::of(e), s, ct)
+    /// Open a sealed payload; also says whether it was under the type-scoped key. A full
+    /// device tries both keys (the one it would seal with first); a service device has
+    /// only the type-scoped one.
+    fn open_payload(&self, s: &SealInfo, e: &LogEntry, ct: &[u8]) -> Result<(Zeroizing<Vec<u8>>, bool)> {
+        let r = RecordRef::of(e);
+        let scoped = || -> Result<Zeroizing<Vec<u8>>> {
+            let k = self.keys.sync_key(&self.user_id, &e.typ, s.epoch, &s.key)?;
+            open_record_scoped(&k, &self.user_id, &r, s, ct)
+        };
+        let Some(epoch_key) = self.keys.get(&s.key) else {
+            if !self.keys.has(&s.key) {
+                return Err(SyncError::Crypto("sealed under an epoch key this device does not hold".into()));
+            }
+            return scoped().map(|p| (p, true)).map_err(|_| {
+                SyncError::Crypto("does not open under this type's scoped key (sealed under the epoch key, or the type is not granted)".into())
+            });
+        };
+        let legacy = || open_record(epoch_key, &self.user_id, &r, s, ct);
+        if self.seals_scoped(&e.typ) {
+            scoped().map(|p| (p, true)).or_else(|_| legacy().map(|p| (p, false)))
+        } else {
+            legacy().map(|p| (p, false)).or_else(|_| scoped().map(|p| (p, true)))
+        }
     }
 
     /// The latest entry of every record of `typ` (by HLC).
@@ -375,10 +465,14 @@ impl crate::net::SyncState {
         latest.into_values().collect()
     }
 
-    /// Re-seal, under the head epoch key, every record of sealed `typ` whose latest
-    /// entry is sealed under an older key and readable here. Optional: members keep
-    /// older epoch keys (and admitted devices receive them), so old entries stay
-    /// readable without it. The new entry is a later write of the same value, so run
+    /// Re-seal, under the head rotation, every record of sealed `typ` whose latest
+    /// entry is sealed under an older key, or (since 0.8.4) under the other scheme than a
+    /// write here would use now ([`crate::SyncState::seals_scoped`]), and readable here.
+    /// After a service device is granted `typ`, a full device's run moves records sealed
+    /// with the epoch key to the type-scoped key so that device can open them; once no
+    /// service device is granted `typ` any more, it moves them back. Members keep older
+    /// epoch keys (and admitted devices receive them), so old entries stay readable by
+    /// full devices without it. The new entry is a later write of the same value, so run
     /// it after syncing. A device revoked earlier keeps whatever it could already read;
     /// change the secret itself when that matters. Returns the re-sealed record ids.
     pub fn reseal_stale(&mut self, now_ms: u64, typ: &str) -> Result<Vec<String>> {
@@ -386,13 +480,17 @@ impl crate::net::SyncState {
             return Ok(Vec::new());
         }
         let Some(head) = self.current_key().id else { return Err(SyncError::Refused("no-epoch-key".into())) };
+        let want_scoped = self.seals_scoped(typ);
         let mut todo = Vec::new();
         for e in self.latest_entries(typ) {
             let Some(s) = e.value.as_ref().and_then(|v| v.seal.as_ref()) else { continue };
-            if s.key == head {
+            // Under the head with no epoch key: type-scoped already (nothing else opens here).
+            if s.key == head && !self.keys.has_epoch_key(&head) {
                 continue;
             }
-            if let Ok(RecordValue::Ready(plain)) = self.read(e) {
+            if let Ok((RecordValue::Ready(plain), Some(scoped))) = self.read_scheme(e)
+                && (s.key != head || scoped != want_scoped)
+            {
                 todo.push((e.record_id.clone(), plain, e.op.clone()));
             }
         }
