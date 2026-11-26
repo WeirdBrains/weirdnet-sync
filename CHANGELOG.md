@@ -6,6 +6,15 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Service devices with sync types now hold type-scoped keys for their granted types only, never an epoch key: in the link bundle, in admissions after a rotation, and after loading epoch keys an older device handed them. A device granted `ymir.train` can no longer open `ymir.context` pages or sealed records.
+- Devices refuse a service peer's `Hello`, `Pull` and `Ack` for types outside its grant, and lease requests from roster-only devices (`type-not-granted`).
+
+### Added
+
+- `EpochKeys::get_scoped`, `insert_scoped`, `scoped_types`, `scoped_len`, `epoch_key_count`, `has_epoch_key`, `sync_key`, `scope`, `narrow_to`; `Envelope::seal_scoped` and `open_scoped`; `DeviceGrant::scoped_types`, `Roster::scoped_types`, `Roster::may_sync`; `LEASE_TYPE` at the crate root.
+
 ## [0.8.2] - 2026-11-25
 
 ### Fixed
