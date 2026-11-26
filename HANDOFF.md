@@ -2,6 +2,16 @@
 
 Running log for [weirdnet-sync](https://github.com/WeirdBrains/weirdnet-sync), newest first. Shared rules: the collective `AGENTS.md` of [Weird Brains](https://weirdbrains.com) projects.
 
+## 2026-11-25: released 0.8.1
+
+What changed: `release: v0.8.1` ([`cf8d275`](https://github.com/WeirdBrains/weirdnet-sync/commit/cf8d275e1bbb110f79a251b7a9613a273584b8a8)), annotated tag [`v0.8.1`](https://github.com/WeirdBrains/weirdnet-sync/releases/tag/v0.8.1), published to [crates.io](https://crates.io/crates/weirdnet-sync/0.8.1) with `scripts/weirdnet_release.py --patch` from weirdnet-project-helpers.
+
+Checks run: CI on the release commit passed on Linux, macOS and Windows.
+
+Not tested: as in the entry below.
+
+What's left and next: [weirdnet-agent](https://github.com/WeirdBrains/weirdnet-agent) 0.5.6 builds its `jobs` feature on this release. Possible follow-up: `Cargo.lock` still resolves the yanked weirdnet-net 0.8.0 and weirdnet-keys 0.1.0 (a `cargo update` warning, no build change).
+
 ## 2026-11-25: job rules, pause and resume, voter limits (for 0.8.1)
 
 What changed: additive job features for synced training jobs (requested for Ymir's resume-on-another-node work), in [`1be60da`](https://github.com/WeirdBrains/weirdnet-sync/commit/1be60daf8edfc40fc4a6dbddbd0bfd1c915b2855) and docs/CI in [`4e2b96c`](https://github.com/WeirdBrains/weirdnet-sync/commit/4e2b96c4dca1e2e63b73ea678a8179dee296f7fd).
