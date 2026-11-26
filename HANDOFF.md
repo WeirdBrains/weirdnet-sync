@@ -2,6 +2,16 @@
 
 Running log for [weirdnet-sync](https://github.com/WeirdBrains/weirdnet-sync), newest first. Shared rules: the collective `AGENTS.md` of [Weird Brains](https://weirdbrains.com) projects.
 
+## 2026-11-26: released v0.8.3
+
+What changed: [`d0bfe9d`](https://github.com/WeirdBrains/weirdnet-sync/commit/d0bfe9dc32a22e0154d38b1a2e63a7c5e2e2cc3e) (`release: v0.8.3`, tag [`v0.8.3`](https://github.com/WeirdBrains/weirdnet-sync/releases/tag/v0.8.3)), published as [weirdnet-sync 0.8.3](https://crates.io/crates/weirdnet-sync/0.8.3) ([docs.rs](https://docs.rs/weirdnet-sync/0.8.3)) with the shared release script. The first upload got a crates.io 500; `crates --tag v0.8.3` published it.
+
+Checks run: CI green on Linux, macOS and Windows for the change and the release commit; the release script's checks. weirdnet-agent 0.5.6 (`jobs,pool,serve`) and weirdnet-backends 0.4.7 (`node`) pass their tests on the published 0.8.3, and resolve with it to one weirdnet-sync. The site ([net.weirdbrains.com](https://net.weirdbrains.com/crates/sync)) shows 0.8.3.
+
+Not tested: see the entry below.
+
+Next: nothing for this release.
+
 ## 2026-11-26: type-scoped keys for service devices (for 0.8.3)
 
 What changed: [`94aa8f7`](https://github.com/WeirdBrains/weirdnet-sync/commit/94aa8f7ca0ae3c22dbd5e144d6d50f16f618b64e) (code), [`d28ce72`](https://github.com/WeirdBrains/weirdnet-sync/commit/d28ce72305c395934afd4f5029499915009581e8) (tests), [`9e20eb8`](https://github.com/WeirdBrains/weirdnet-sync/commit/9e20eb8bcfad44b34ad6db8e4811fdb0cb2b419d) (README, CHANGELOG). Requested for Ymir, so cert-only model nodes can run and vote on `ymir.train` jobs without being able to read `ymir.context`.
