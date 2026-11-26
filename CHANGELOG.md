@@ -6,6 +6,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-25
+
 ### Added
 
 - `JobRules` on `JobSpec` (`with_rules`): claim candidates and a role, enforced when folding and by voters; a takeover wait after a lapsed claim; a backoff after a retryable failure (`JobView::not_before_ms`, `LeaseError::NotYet`).
@@ -151,7 +153,8 @@ Releases as 0.7.0 (breaking: `SyncState::seed` is an `Option`, `Roster` and `Key
 
 - HLC, op log, LWW registers, OR-sets, tombstone GC, SyncKey page sealing, roster / self-cert / revocation, and the `weirdnet-sync/v1` protocol over `weirdnet-net` 0.6.0.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.5.2...v0.6.0
