@@ -352,6 +352,8 @@ impl SyncState {
         let reply = match msg {
             Message::Hello(_) | Message::Pull(_) | Message::Ack(_) if !granted(&env.typ) => Message::Refuse(Refuse::new("type-not-granted")),
             Message::Pull(ref p) if !granted(&p.typ) => Message::Refuse(Refuse::new("type-not-granted")),
+            // Each type travels under its own key: a page is sealed under the type it holds.
+            Message::Pull(ref p) if p.typ != env.typ => Message::Refuse(Refuse::new("type-mismatch")),
             Message::LeaseAsk(_) | Message::LeaseFree(_) if !granted(crate::lease::LEASE_TYPE) => Message::Refuse(Refuse::new("type-not-granted")),
             Message::Hello(h) => self.on_hello(from, h, at_head),
             Message::Pull(_) if !at_head => Message::Refuse(Refuse::new("epoch-behind")),
@@ -646,6 +648,159 @@ pub fn pull_from_shared(state: &Mutex<SyncState>, node: &Node<Vec<u8>, Vec<u8>>,
     }
 }
 
+/// Pull several record types from `peer` in one session: one Hello (and at most one roster
+/// swap) for all of them, then each type's pages and acks, every envelope sealed under that
+/// type's own key. Works with any `/weirdnet/sync/2` peer (0.7 and 0.8.x answer each
+/// request on its own, so the wire does not change).
+///
+/// Each type gets its own [`PullOutcome`], in the order asked: a type the peer refuses
+/// (`type-not-granted` for a service device, `type-off` where the peer does not sync it)
+/// fails alone and the others still pull. A service device does not ask for a type outside
+/// its own grant; that type is refused here with `type-not-granted`. Duplicate types are
+/// pulled once.
+pub fn pull_types(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: PeerId, addrs: &[Multiaddr], types: &[&str]) -> PullTypesOutcome {
+    let mut asked: Vec<&str> = Vec::new();
+    for t in types {
+        if !asked.contains(t) {
+            asked.push(t);
+        }
+    }
+    let mut out: Vec<(String, PullOutcome)> = Vec::with_capacity(asked.len());
+    let done = |t: &str, applied: usize, error: Option<SyncError>| (t.to_string(), PullOutcome { applied, error });
+    // A service device asks only for what its grant covers (it holds no key for the rest).
+    let own = state.our_cert.peer_id.clone();
+    let mut todo: Vec<&str> = Vec::new();
+    for t in asked {
+        if state.is_service() && !state.roster.may_sync(&own, t) {
+            out.push(done(t, 0, Some(SyncError::Refused("type-not-granted".into()))));
+        } else {
+            todo.push(t);
+        }
+    }
+    // Say hello under the first type the peer accepts; one it refuses is not granted there.
+    let mut session = None;
+    while session.is_none() && !todo.is_empty() {
+        let first = todo[0];
+        match open_session(state, node, peer, addrs, first) {
+            Ok(Some(s)) => session = Some(s),
+            // Roster-only (this device or the peer): the roster swap was the whole pass.
+            Ok(None) => {
+                out.extend(todo.drain(..).map(|t| done(t, 0, None)));
+                return PullTypesOutcome::ordered(out, types);
+            }
+            Err(SyncError::Refused(r)) if r == "type-not-granted" => {
+                out.push(done(first, 0, Some(SyncError::Refused(r))));
+                todo.remove(0);
+            }
+            Err(e) => {
+                out.extend(todo.drain(..).map(|t| done(t, 0, Some(copy_error(&e)))));
+                return PullTypesOutcome::ordered(out, types);
+            }
+        }
+    }
+    let Some(session) = session else { return PullTypesOutcome::ordered(out, types) };
+    let mut any_ok = false;
+    for t in todo {
+        let mut applied = 0;
+        let error = pull_with(state, node, peer, addrs, &session, t, &mut applied).err();
+        any_ok |= error.is_none();
+        out.push(done(t, applied, error));
+    }
+    if any_ok && let Err(e) = close_session(state) {
+        // A rotation that failed after the pages were applied: report it on every type
+        // that had finished, as [`pull_from`] would.
+        for (_, o) in out.iter_mut().filter(|(_, o)| o.error.is_none()) {
+            o.error = Some(copy_error(&e));
+        }
+    }
+    PullTypesOutcome::ordered(out, types)
+}
+
+/// [`pull_types`] for a state shared with this node's [`SyncHandler`], without holding its
+/// lock across the network (as [`pull_from_shared`] does for one type).
+pub fn pull_types_shared(
+    state: &Mutex<SyncState>,
+    node: &Node<Vec<u8>, Vec<u8>>,
+    peer: PeerId,
+    addrs: &[Multiaddr],
+    types: &[&str],
+) -> PullTypesOutcome {
+    let mut snap = match state.lock() {
+        Ok(st) => st.snapshot(),
+        Err(_) => return PullTypesOutcome::failed(types, &SyncError::Protocol("sync state lock poisoned".into())),
+    };
+    let mut out = pull_types(&mut snap, node, peer, addrs, types);
+    match state.lock() {
+        Ok(mut st) => {
+            st.merge_back(&snap);
+        }
+        Err(_) => {
+            for (_, o) in out.types.iter_mut() {
+                o.error = Some(SyncError::Protocol("sync state lock poisoned".into()));
+            }
+        }
+    }
+    out
+}
+
+/// The result of [`pull_types`]: one [`PullOutcome`] per type asked, in the order asked.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct PullTypesOutcome {
+    /// Each type with what its pull applied and, if it stopped early, why.
+    pub types: Vec<(String, PullOutcome)>,
+}
+
+impl PullTypesOutcome {
+    fn ordered(mut got: Vec<(String, PullOutcome)>, asked: &[&str]) -> Self {
+        let mut types = Vec::with_capacity(got.len());
+        for t in asked {
+            if let Some(i) = got.iter().position(|(g, _)| g == t) {
+                types.push(got.swap_remove(i));
+            }
+        }
+        Self { types }
+    }
+
+    fn failed(asked: &[&str], e: &SyncError) -> Self {
+        let mut types: Vec<(String, PullOutcome)> = Vec::new();
+        for t in asked {
+            if !types.iter().any(|(g, _)| g == t) {
+                types.push((t.to_string(), PullOutcome { applied: 0, error: Some(copy_error(e)) }));
+            }
+        }
+        Self { types }
+    }
+
+    /// Whether every type pulled to the end.
+    pub fn is_ok(&self) -> bool {
+        self.types.iter().all(|(_, o)| o.is_ok())
+    }
+
+    /// New log entries stored, over all types.
+    pub fn applied(&self) -> usize {
+        self.types.iter().map(|(_, o)| o.applied).sum()
+    }
+
+    /// The outcome for `typ`, if it was asked for.
+    pub fn get(&self, typ: &str) -> Option<&PullOutcome> {
+        self.types.iter().find(|(t, _)| t == typ).map(|(_, o)| o)
+    }
+}
+
+/// The same error again, for each type a failed session stops ([`SyncError`] is not `Clone`).
+fn copy_error(e: &SyncError) -> SyncError {
+    match e {
+        SyncError::Crypto(m) => SyncError::Crypto(m.clone()),
+        SyncError::Refused(m) => SyncError::Refused(m.clone()),
+        SyncError::Codec(m) => SyncError::Codec(m.clone()),
+        SyncError::Protocol(m) => SyncError::Protocol(m.clone()),
+        SyncError::Io(m) => SyncError::Io(m.clone()),
+        SyncError::Identity(m) => SyncError::Identity(m.clone()),
+        SyncError::NotPermitted(m) => SyncError::NotPermitted(m.clone()),
+    }
+}
+
 fn pull_session(
     state: &mut SyncState,
     node: &Node<Vec<u8>, Vec<u8>>,
@@ -654,10 +809,26 @@ fn pull_session(
     typ_name: &str,
     applied: &mut usize,
 ) -> Result<()> {
+    let Some(session) = open_session(state, node, peer, addrs, typ_name)? else { return Ok(()) };
+    pull_with(state, node, peer, addrs, &session, typ_name, applied)?;
+    close_session(state)
+}
+
+/// What a Hello settled: the key to pull under and the nodes the peer holds ops of. Any
+/// number of types can then be pulled with it, each under its own key.
+struct Session {
+    key: KeyRef,
+    nodes: Vec<(NodeId, u64)>,
+}
+
+/// Hello (sealed under `typ_name`'s key) and catch up on rosters and rotations both ways.
+/// `None` when this device or the peer is roster-only: the roster swap is all there is.
+fn open_session(state: &mut SyncState, node: &Node<Vec<u8>, Vec<u8>>, peer: PeerId, addrs: &[Multiaddr], typ_name: &str) -> Result<Option<Session>> {
     let from = node.peer_id().to_string();
     // A roster-only device (this one or the peer) has no data keys: swap rosters, unsealed.
     if state.key_status() == KeyStatus::RosterOnly || !state.roster.holds_keys(&peer.to_string()) {
-        return roster_exchange(state, node, peer, addrs, typ_name);
+        roster_exchange(state, node, peer, addrs, typ_name)?;
+        return Ok(None);
     }
     // A service device without the head key: catch up on the roster first (it may carry
     // a rotation sealed to us).
@@ -729,17 +900,35 @@ fn pull_session(
         let env = state.seal_envelope(&key, typ_name, &from, &state.roster_msg())?;
         let _ = request(node, peer, addrs, &env)?;
     }
-    let mut to_pull: Vec<(NodeId, u64)> = ok.cursors;
+    let mut nodes: Vec<(NodeId, u64)> = ok.cursors;
     // Also pull the peer's own node if it wasn't in cursors yet.
-    if !to_pull.iter().any(|(n, _)| n.0 == peer.to_string()) {
-        to_pull.push((NodeId(peer.to_string()), 0));
+    if !nodes.iter().any(|(n, _)| n.0 == peer.to_string()) {
+        nodes.push((NodeId(peer.to_string()), 0));
     }
-    pull_type(state, node, peer, addrs, &key, &to_pull, typ_name, false, applied)?;
+    Ok(Some(Session { key, nodes }))
+}
+
+/// Pull `typ_name` (and its pending chunks) over an open session.
+fn pull_with(
+    state: &mut SyncState,
+    node: &Node<Vec<u8>, Vec<u8>>,
+    peer: PeerId,
+    addrs: &[Multiaddr],
+    s: &Session,
+    typ_name: &str,
+    applied: &mut usize,
+) -> Result<()> {
+    pull_type(state, node, peer, addrs, &s.key, &s.nodes, typ_name, false, applied)?;
     // Chunks of entries that are still incomplete come along with their type (not
     // counted: they complete entries already counted).
     if !is_chunk_type(typ_name) && state.options(typ_name).limits.eager_chunks && !state.log.pending_blobs(typ_name).is_empty() {
-        pull_type(state, node, peer, addrs, &key, &to_pull, &chunk_type(typ_name), true, &mut 0)?;
+        pull_type(state, node, peer, addrs, &s.key, &s.nodes, &chunk_type(typ_name), true, &mut 0)?;
     }
+    Ok(())
+}
+
+/// After a session's pulls: move the clock, and make a rotation that has come due.
+fn close_session(state: &mut SyncState) -> Result<()> {
     observe(state, now_ms());
     if state.auto_first_rotation && state.first_rotation_due() {
         // Linked devices still on seed-derived keys, all with device keys: start the

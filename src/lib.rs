@@ -33,8 +33,8 @@ pub use lease::{
 pub use log::{LogEntry, OpLog, Page as LogPage};
 pub use merge::{CONFLICT_KEEP_MS, Lww, OrSet, TOMBSTONE_GC_MS, can_gc_tombstone, edit_vs_delete, folder_cycle, lww};
 pub use net::{
-    LinkBundle, MergeOutcome, PullOutcome, SyncHandler, SyncState, node_config, pull_chunks, pull_from, pull_from_outcome, pull_from_shared,
-    start_node,
+    LinkBundle, MergeOutcome, PullOutcome, PullTypesOutcome, SyncHandler, SyncState, node_config, pull_chunks, pull_from, pull_from_outcome,
+    pull_from_shared, pull_types, pull_types_shared, start_node,
 };
 pub use plan::Plan;
 pub use protocol::{
