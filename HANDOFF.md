@@ -2,6 +2,23 @@
 
 Running log for [weirdnet-sync](https://github.com/WeirdBrains/weirdnet-sync), newest first. Shared rules: the collective `AGENTS.md` of [Weird Brains](https://weirdbrains.com) projects.
 
+## 2026-11-26: several types in one sync session (for 0.8.5)
+
+What changed: [`fb83317`](https://github.com/WeirdBrains/weirdnet-sync/commit/fb8331750c85c29e6850d2f017c5d95726164103) (code), [`6c17f58`](https://github.com/WeirdBrains/weirdnet-sync/commit/6c17f58e722c9bd291482e6bbeab2931137335df) (tests), plus this commit (README, CHANGELOG). Asked for Bragi and Ymir, which pulled each record type in its own session.
+
+- Each `pull_from` said `Hello` (and swapped rosters when the peer was behind) once per type. The server already answers every request on its own (no server-side session state), and weirdnet-net keeps the connection open between requests, so only the Hello and roster swap were repeated.
+- `pull_session` is split into `open_session` (Hello and the roster and rotation catch-up, sealed under the first type), `pull_with` (one type and its pending chunks, under that type's own key) and `close_session` (clock and due rotations). `pull_from` runs all three for one type, as before.
+- New `pull_types` / `pull_types_shared`: one session for several types, one `PullOutcome` per type in a `PullTypesOutcome` (`types`, `get`, `applied`, `is_ok`). A service device skips types outside its own grant (`type-not-granted`, no request sent); a type the peer refuses fails alone and the rest still pull; a Hello refused `type-not-granted` moves to the next type. No wire change, so it works against 0.7.1 and 0.8.0 to 0.8.4 peers.
+- Servers now refuse a `Pull` sealed under another type than the one it asks for (`type-mismatch`); every released client seals each `Pull` under its own type.
+
+Checks run: `cargo fmt --check`; `cargo clippy --all-targets` (default and `--all-features`) with `-D warnings`; `cargo test` default, `--all-features` and `--no-default-features` (110 tests: the 104 before plus 6 in `tests/multi_type.rs`, `compat_07`, `compat_082` and `sealed_scoped` included); `cargo doc --no-deps` with `-D warnings`; `cargo semver-checks` against 0.8.4 (no breaking changes).
+
+Not tested: a real network (all tests use the in-memory transport); timings (the Hello saved per type was not measured); a service device linked by a pre-0.8.3 device that still holds epoch keys (the server-side `type-not-granted` path for Hello is covered only by the existing per-type tests).
+
+What's left: release 0.8.5; weirdnet-agent and Bragi can move their per-type pull loops onto `pull_types`.
+
+Next: release with the shared script once CI is green on Linux, macOS and Windows, then update the site.
+
 ## 2026-11-26: released v0.8.4
 
 What changed: [`f02e130`](https://github.com/WeirdBrains/weirdnet-sync/commit/f02e130b31aa4847e90c956963e7c0b2b82772e9) (`release: v0.8.4`, tag [`v0.8.4`](https://github.com/WeirdBrains/weirdnet-sync/releases/tag/v0.8.4)), published as [weirdnet-sync 0.8.4](https://crates.io/crates/weirdnet-sync/0.8.4) ([docs.rs](https://docs.rs/weirdnet-sync/0.8.4)) with the shared release script (`--patch`).

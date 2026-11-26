@@ -6,6 +6,14 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `pull_types` and `pull_types_shared` pull several record types from a peer in one session (one hello for all of them, each type under its own key), with one outcome per type in `PullTypesOutcome`. Works with 0.7.1 and 0.8.0–0.8.4 peers.
+
+### Security
+
+- A `Pull` sealed under another type than the one it asks for is refused (`type-mismatch`).
+
 ## [0.8.4] - 2026-11-26
 
 ### Fixed
