@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use weirdnet_net::user::{self, NodeCert};
 use weirdnet_net::{Keypair, Multiaddr, Node, WEIRDNET};
 use weirdnet_sync::{
-    DeviceClass, FenceGuard, Identity, JobEvent, JobSpec, JobStatus, Jobs, LeaseConfig, LeaseError, LeaseHandle, LeaseName, Leases, LinkBundle,
-    Roster, SyncState, Term, Voter, Voters, node_config, pull_from, start_node,
+    DeviceClass, FenceGuard, Identity, JobEvent, JobRules, JobSpec, JobStatus, Jobs, LeaseConfig, LeaseError, LeaseHandle, LeaseName, Leases,
+    LinkBundle, Roster, SyncState, Term, Voter, Voters, job_lease, node_config, pull_from, start_node,
 };
 
 const T: &str = "ymir.pool";
@@ -434,6 +434,51 @@ fn a_job_is_reclaimed_after_its_worker_dies_and_resumes_from_the_checkpoint() {
     assert!(jobs.open().is_empty());
     drop(st);
     assert!(p.nodes[0].leases.claim_job(T, "batch-1", &jcfg).is_err(), "a finished job is not claimed again");
+}
+
+/// Every node pulls node `from`'s job log.
+fn spread(p: &Pool, from: usize) {
+    let (peer_id, a) = (p.nodes[from].node.peer_id(), addrs(&p.nodes[from].node));
+    for (i, n) in p.nodes.iter().enumerate() {
+        if i != from {
+            let mut st = n.st.lock().unwrap();
+            pull_from(&mut st, &n.node, peer_id, &a, T).unwrap();
+        }
+    }
+}
+
+#[test]
+fn job_rules_hold_voters_to_candidates_and_the_takeover_wait() {
+    let mut p = pool(3);
+    let wait = Duration::from_millis(2_000);
+    let outsider = peer(&p.nodes[2].k);
+    let rules = JobRules::new().with_candidates([peer(&p.nodes[0].k), peer(&p.nodes[1].k)]).with_takeover_after(wait);
+    let spec = JobSpec::new("train-1", "ymir.train", b"{}".to_vec()).with_claim(LEASE).with_rules(rules);
+    Jobs::new(&mut p.nodes[0].st.lock().unwrap(), T).post(now_ms(), spec).unwrap();
+    spread(&p, 0);
+    let jcfg = cfg();
+    // The outsider is refused locally, and voters refuse its raw ask for the job's lease.
+    assert!(matches!(p.nodes[2].leases.claim_job(T, "train-1", &jcfg), Err(LeaseError::NotEligible)));
+    let lease = job_lease(T, "train-1").unwrap();
+    let raw = p.nodes[2].leases.acquire(&lease, &jcfg.clone().with_duration(LEASE));
+    assert!(matches!(raw, Err(LeaseError::NoQuorum { .. })), "{raw:?} from {outsider}");
+    let h1 = got(|| p.nodes[0].leases.claim_job(T, "train-1", &jcfg));
+    // Node 0 crashes without letting go: node 1 waits for the lapse plus the takeover wait.
+    let at = Instant::now();
+    let left = h1.remaining();
+    drop(kill(&mut p, 0));
+    let h2 = retry_until(LEASE * 4 + wait, || match p.nodes[0].leases.claim_job(T, "train-1", &jcfg) {
+        Ok(h) => Some(h),
+        Err(LeaseError::Held { .. } | LeaseError::NoQuorum { .. }) => None,
+        Err(e) => panic!("{e:?}"),
+    })
+    .expect("taken over after the wait");
+    assert!(at.elapsed() >= left + wait - Duration::from_millis(100), "{:?} < {:?} + {:?}", at.elapsed(), left, wait);
+    assert!(h2.term() > h1.term());
+    let me = peer(&p.nodes[0].k);
+    let mut st = p.nodes[0].st.lock().unwrap();
+    let v = Jobs::new(&mut st, T).view("train-1").unwrap();
+    assert_eq!((v.status, v.claim), (JobStatus::Claimed, Some((me, h2.term()))));
 }
 
 #[test]

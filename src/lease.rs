@@ -8,7 +8,7 @@
 //! token: resources refuse commands with a term older than one they have seen
 //! ([`FenceGuard`]), so a paused or partitioned ex-holder can do no harm.
 //!
-//! Asks and answers are [`Message`](crate::Message) variants on `/weirdnet/sync/2`, sealed
+//! Asks and answers are [`Message`] variants on `/weirdnet/sync/2`, sealed
 //! like every other request, so only active, admitted devices of the user take part. A
 //! voter answers only candidates that are in the same voter set. Safety needs no wall clock
 //! and no HLC; only rate drift within [`LeaseConfig::max_drift`].
@@ -95,6 +95,23 @@ impl Term {
 impl std::fmt::Display for Term {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+/// Per-lease limits a [`Voter`] applies (since 0.8.1): the longest grant, and how long it
+/// refuses another holder after a promise lapsed (its holder stopped renewing without letting
+/// go). Set them per lease-name prefix with [`Voter::with_limits`]; a job's own
+/// [`JobRules`](crate::jobs::JobRules) set them for its claim lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LeaseLimits {
+    pub max_duration: Duration,
+    pub takeover_after: Duration,
+}
+
+impl LeaseLimits {
+    pub fn new(max_duration: Duration, takeover_after: Duration) -> Self {
+        Self { max_duration, takeover_after }
     }
 }
 
@@ -263,6 +280,9 @@ struct Slot {
 struct Persisted {
     v: u8,
     terms: Vec<(LeaseName, Term, String)>,
+    /// The longest grant given (since 0.8.1), so a restart waits it out.
+    #[serde(default)]
+    longest_ms: u64,
 }
 
 type Persist = Arc<dyn Fn(&[u8]) -> std::io::Result<()> + Send + Sync>;
@@ -281,6 +301,10 @@ pub struct Voter {
     grace_until: Instant,
     slots: HashMap<LeaseName, Slot>,
     persist: Option<Persist>,
+    /// Limits per lease-name prefix, longest prefix first.
+    limits: Vec<(String, LeaseLimits)>,
+    /// The longest grant given so far.
+    longest: Duration,
 }
 
 impl std::fmt::Debug for Voter {
@@ -290,6 +314,7 @@ impl std::fmt::Debug for Voter {
             .field("max_duration", &self.max_duration)
             .field("slots", &self.slots)
             .field("persist", &self.persist.is_some())
+            .field("limits", &self.limits)
             .finish()
     }
 }
@@ -298,7 +323,53 @@ impl Voter {
     /// A voter answering candidates in `candidates` (normally the same [`Voters`] the
     /// leases use). It refuses takeovers for [`DEFAULT_DURATION`] after it starts.
     pub fn new(candidates: Voters) -> Self {
-        Self { candidates, max_duration: DEFAULT_DURATION, grace_until: Instant::now() + DEFAULT_DURATION, slots: HashMap::new(), persist: None }
+        Self {
+            candidates,
+            max_duration: DEFAULT_DURATION,
+            grace_until: Instant::now() + DEFAULT_DURATION,
+            slots: HashMap::new(),
+            persist: None,
+            limits: Vec::new(),
+            longest: Duration::ZERO,
+        }
+    }
+
+    /// When it started (the grace runs from there).
+    fn started(&self) -> Instant {
+        self.grace_until - self.grace()
+    }
+
+    /// How long it refuses takeovers after starting: its longest possible grant.
+    fn grace(&self) -> Duration {
+        self.limits.iter().map(|(_, l)| l.max_duration).chain([self.max_duration, self.longest]).max().unwrap_or(self.max_duration)
+    }
+
+    /// Limits for lease names starting with `prefix` (since 0.8.1), for example
+    /// `ymir.train/` with 60 s grants and a 5 min takeover wait. The longest matching prefix
+    /// wins; the restart grace grows to the longest grant. A job's own rules take precedence
+    /// for its claim lease when this device has synced the job.
+    pub fn with_limits(mut self, prefix: impl Into<String>, max_duration: Duration, takeover_after: Duration) -> Self {
+        let started = self.started();
+        let prefix = prefix.into();
+        self.limits.retain(|(p, _)| *p != prefix);
+        self.limits.push((prefix, LeaseLimits::new(max_duration, takeover_after)));
+        self.limits.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        self.grace_until = started + self.grace();
+        self
+    }
+
+    /// The limits for `name`: the longest matching prefix's, if any.
+    pub fn limits_for(&self, name: &LeaseName) -> Option<LeaseLimits> {
+        self.limits.iter().find(|(p, _)| name.as_str().starts_with(p.as_str())).map(|(_, l)| *l)
+    }
+
+    /// Copies another voter's maximum and per-prefix limits (keeping this one's terms).
+    pub(crate) fn with_settings_of(mut self, other: &Voter) -> Self {
+        let started = self.started();
+        self.max_duration = other.max_duration;
+        self.limits = other.limits.clone();
+        self.grace_until = started + self.grace();
+        self
     }
 
     /// Write [`export`](Self::export) with `store` before each new term is granted (renewals
@@ -310,9 +381,9 @@ impl Voter {
 
     /// The longest grant it gives, which is also the restart grace (default 15 s).
     pub fn with_max_duration(mut self, max: Duration) -> Self {
-        let started = self.grace_until - self.max_duration;
+        let started = self.started();
         self.max_duration = max;
-        self.grace_until = started + max;
+        self.grace_until = started + self.grace();
         self
     }
 
@@ -320,7 +391,7 @@ impl Voter {
     pub fn export(&self) -> Vec<u8> {
         let mut terms: Vec<_> = self.slots.iter().map(|(n, s)| (n.clone(), s.max_term, s.max_holder.clone())).collect();
         terms.sort();
-        encode(&Persisted { v: 1, terms }).unwrap_or_default()
+        encode(&Persisted { v: 1, terms, longest_ms: self.longest.as_millis().min(u64::MAX as u128) as u64 }).unwrap_or_default()
     }
 
     /// A voter restarted from [`export`](Self::export): it never grants an old term again and
@@ -328,6 +399,9 @@ impl Voter {
     pub fn import(bytes: &[u8], candidates: Voters) -> Result<Self> {
         let p: Persisted = decode(bytes)?;
         let mut v = Self::new(candidates);
+        let started = v.started();
+        v.longest = Duration::from_millis(p.longest_ms);
+        v.grace_until = started + v.grace();
         for (name, term, holder) in p.terms {
             v.slots.insert(name, Slot { max_term: term, max_holder: holder, promise: None });
         }
@@ -350,24 +424,42 @@ impl Voter {
 
     /// The voter rule. `from` is the transport-authenticated asker.
     pub fn on_ask(&mut self, from: &str, ask: &LeaseAsk, now: Instant) -> Message {
+        self.on_ask_with(from, ask, now, None)
+    }
+
+    /// [`on_ask`](Self::on_ask) with `limits` in place of the prefix limits (since 0.8.1;
+    /// the sync state passes a job's own rules here).
+    pub fn on_ask_with(&mut self, from: &str, ask: &LeaseAsk, now: Instant, limits: Option<LeaseLimits>) -> Message {
         let in_grace = now < self.grace_until;
         let grace_left = self.grace_until.saturating_duration_since(now);
-        let duration = Duration::from_millis(ask.duration_ms as u64).min(self.max_duration);
+        let limits = limits.or_else(|| self.limits_for(&ask.name));
+        let max = limits.map(|l| l.max_duration).unwrap_or(self.max_duration);
+        let takeover_after = limits.map(|l| l.takeover_after).unwrap_or_default();
+        let duration = Duration::from_millis(ask.duration_ms as u64).min(max);
+        let longer = duration > self.longest;
         let slot = self.slots.entry(ask.name.clone()).or_default();
         let live = slot.promise.as_ref().filter(|p| p.until > now).cloned();
+        // A promise that ran out without its holder letting go holds others off for the
+        // takeover wait.
+        let lapsed = slot.promise.as_ref().filter(|p| p.until <= now && p.holder != from && now < p.until + takeover_after).cloned();
         // Renewal (or re-establishing a lapsed promise): only the holder the term went to, and
         // only while no higher term was granted here.
         let renewal = ask.term == slot.max_term && slot.max_holder == from && ask.term.0 > 0;
         // Takeover or first grant: a higher term, nobody else promised.
-        let takeover = ask.term > slot.max_term && live.as_ref().is_none_or(|p| p.holder == from) && !in_grace;
+        let takeover = ask.term > slot.max_term && live.as_ref().is_none_or(|p| p.holder == from) && lapsed.is_none() && !in_grace;
         if renewal || takeover {
             let before = slot.clone();
             slot.max_term = ask.term;
             slot.max_holder = from.to_string();
             slot.promise = Some(Promise { term: ask.term, holder: from.to_string(), until: now + duration });
-            if takeover && let Some(store) = self.persist.clone() {
+            let longest_before = self.longest;
+            self.longest = self.longest.max(duration);
+            if (takeover || longer)
+                && let Some(store) = self.persist.clone()
+            {
                 // The new term must be durable before anyone acts on it.
                 if store(&self.export()).is_err() {
+                    self.longest = longest_before;
                     let slot = self.slots.entry(ask.name.clone()).or_default();
                     *slot = before;
                     return Message::LeaseDeny(LeaseDeny {
@@ -381,10 +473,11 @@ impl Voter {
             }
             return Message::LeaseGrant(LeaseGrant { name: ask.name.clone(), term: ask.term, duration_ms: duration.as_millis() as u32 });
         }
-        let (promised, holder, remaining) = match &live {
-            Some(p) => (p.term, p.holder.clone(), p.until - now),
-            None if in_grace => (slot.max_term, slot.max_holder.clone(), grace_left),
-            None => (slot.max_term, String::new(), Duration::ZERO),
+        let (promised, holder, remaining) = match (&live, &lapsed) {
+            (Some(p), _) => (p.term, p.holder.clone(), p.until - now),
+            (None, Some(p)) => (p.term, p.holder.clone(), (p.until + takeover_after).saturating_duration_since(now)),
+            (None, None) if in_grace => (slot.max_term, slot.max_holder.clone(), grace_left),
+            (None, None) => (slot.max_term, String::new(), Duration::ZERO),
         };
         Message::LeaseDeny(LeaseDeny {
             name: ask.name.clone(),
@@ -418,6 +511,14 @@ impl SyncState {
         if check != CallerCheck::Linked {
             return Message::Refuse(Refuse::new(check.reason().unwrap_or("unknown-device")));
         }
+        // A job's claim lease follows the job's rules when this device has the job.
+        let job = match &msg {
+            Message::LeaseAsk(ask) if self.voter.is_some() => match self.job_lease_limits(&ask.name, from, ask.renew) {
+                Ok(limits) => limits,
+                Err(reason) => return Message::Refuse(Refuse::new(reason)),
+            },
+            _ => None,
+        };
         let roster = &self.roster;
         let Some(voter) = self.voter.as_mut() else { return Message::Refuse(Refuse::new("not-a-voter")) };
         if !voter.candidates.contains(roster, from) {
@@ -429,7 +530,7 @@ impl SyncState {
             // that counts the same voter set.
             Message::LeaseAsk(_) if !voter.candidates.contains(roster, me) => Message::Refuse(Refuse::new("not-a-voter")),
             Message::LeaseAsk(ask) if ask.voters != voter.candidates.digest(roster) => Message::Refuse(Refuse::new("voters-differ")),
-            Message::LeaseAsk(ask) => voter.on_ask(from, &ask, Instant::now()),
+            Message::LeaseAsk(ask) => voter.on_ask_with(from, &ask, Instant::now(), job),
             Message::LeaseFree(free) => {
                 voter.on_free(from, &free);
                 Message::LeaseFree(free)
@@ -488,6 +589,9 @@ pub enum LeaseError {
     /// This device is not among the voters (only voters stand), or no longer is.
     #[error("not a voter for this lease")]
     NotEligible,
+    /// Not claimable yet (a job's retry backoff, since 0.8.1); try again after `retry_in`.
+    #[error("not yet, retry in {retry_in:?}")]
+    NotYet { retry_in: Duration },
     #[error("{0}")]
     Sync(String),
 }
@@ -558,6 +662,12 @@ impl Leases {
         let local = self.terms.lock().map(|t| t.get(name).copied().unwrap_or_default()).unwrap_or_default();
         let voted = self.state.lock().ok().and_then(|st| st.voter.as_ref().map(|v| v.max_term(name))).unwrap_or_default();
         local.max(voted)
+    }
+
+    /// The highest term this device has seen for `name` (asked for, granted or voted on);
+    /// a holder whose term is below it has lost the lease (since 0.8.1).
+    pub fn term_seen(&self, name: &LeaseName) -> Term {
+        self.known_term(name)
     }
 
     fn learn(&self, name: &LeaseName, term: Term) {
@@ -965,6 +1075,11 @@ mod tests {
         LeaseAsk { name: name(n), term: Term(term), duration_ms: 1_000, renew, voters: String::new() }
     }
 
+    /// An ask for an hour, so the voter's limits decide the grant.
+    fn ask_long(n: &str, term: u64, renew: bool) -> LeaseAsk {
+        LeaseAsk { duration_ms: 3_600_000, ..ask(n, term, renew) }
+    }
+
     fn fresh() -> Voter {
         let mut v = Voter::new(Voters::Peers(vec![])).with_max_duration(Duration::from_secs(1));
         v.grace_until = Instant::now() - Duration::from_secs(1);
@@ -1088,5 +1203,64 @@ mod tests {
         }
         // Wall clocks play no part: a lease is the same however far apart they are.
         assert_eq!(valid_until(t0, &[cfg.duration], &cfg), t0 + safe);
+    }
+
+    #[test]
+    fn prefix_limits_allow_longer_grants_and_hold_off_after_a_lapse() {
+        let long = Duration::from_secs(60);
+        let wait = Duration::from_secs(300);
+        let mut v = Voter::new(Voters::Peers(vec![])).with_max_duration(Duration::from_millis(10)).with_limits("ymir.train/", long, wait);
+        let t0 = Instant::now() + long; // past the grace
+        let n = "ymir.train/j1";
+        match v.on_ask("a", &ask_long(n, 1, false), t0) {
+            Message::LeaseGrant(g) => assert_eq!(g.duration_ms, 60_000, "the prefix's 60 s, not the default maximum"),
+            m => panic!("{m:?}"),
+        }
+        match v.on_ask("a", &ask_long("other", 1, false), t0) {
+            Message::LeaseGrant(g) => assert_eq!(g.duration_ms, 10),
+            m => panic!("{m:?}"),
+        }
+        // a stops renewing: its promise lapses at t0 + 60 s, and b waits 5 more minutes.
+        let lapsed = t0 + long + Duration::from_secs(1);
+        match v.on_ask("b", &ask_long(n, 2, false), lapsed) {
+            Message::LeaseDeny(d) => {
+                assert_eq!((d.holder.as_str(), d.promised), ("a", Term(1)));
+                assert_eq!(d.remaining_ms, 299_000);
+            }
+            m => panic!("{m:?}"),
+        }
+        // a itself may come back on its term inside the wait (a network blip).
+        assert!(matches!(v.on_ask("a", &ask_long(n, 1, true), lapsed), Message::LeaseGrant(_)));
+        let later = lapsed + long + wait;
+        assert!(matches!(v.on_ask("b", &ask_long(n, 2, false), later), Message::LeaseGrant(_)));
+        // A released lease has no wait.
+        v.on_free("b", &LeaseFree { name: name(n), term: Term(2) });
+        assert!(matches!(v.on_ask("c", &ask_long(n, 3, false), later), Message::LeaseGrant(_)));
+        // A job's own limits replace the prefix's.
+        let job = LeaseLimits::new(Duration::from_secs(20), Duration::ZERO);
+        match v.on_ask_with("c", &ask_long(n, 3, true), later, Some(job)) {
+            Message::LeaseGrant(g) => assert_eq!(g.duration_ms, 20_000),
+            m => panic!("{m:?}"),
+        }
+    }
+
+    #[test]
+    fn a_restarted_voter_waits_out_its_longest_grant() {
+        let long = Duration::from_secs(60);
+        let mut v = Voter::new(Voters::Peers(vec![])).with_max_duration(Duration::from_millis(10)).with_limits("j/", long, Duration::ZERO);
+        assert!(matches!(v.on_ask("a", &ask_long("j/1", 1, false), Instant::now() + long), Message::LeaseGrant(_)));
+        let bytes = v.export();
+        // Restarted without the prefix limits: the stored longest grant still sets the grace.
+        let mut r = Voter::import(&bytes, Voters::Peers(vec![])).unwrap().with_max_duration(Duration::from_millis(10));
+        let now = Instant::now() + Duration::from_secs(30);
+        assert!(matches!(r.on_ask("b", &ask_long("j/1", 2, false), now), Message::LeaseDeny(_)), "still inside a's possible 60 s");
+        // A 0.8.0 voter.cbor (no longest grant) still loads.
+        #[derive(Serialize)]
+        struct Old {
+            v: u8,
+            terms: Vec<(LeaseName, Term, String)>,
+        }
+        let old = encode(&Old { v: 1, terms: vec![(name("j/1"), Term(4), "a".into())] }).unwrap();
+        assert_eq!(Voter::import(&old, Voters::Peers(vec![])).unwrap().max_term(&name("j/1")), Term(4));
     }
 }

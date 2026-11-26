@@ -412,7 +412,7 @@ impl Identity {
         ensure_dir(&self.dir)?;
         let path = self.dir.join(VOTER);
         let voter = match std::fs::read(&path) {
-            Ok(bytes) => crate::lease::Voter::import(&bytes, candidates)?.with_max_duration(fresh.max_duration()),
+            Ok(bytes) => crate::lease::Voter::import(&bytes, candidates)?.with_settings_of(&fresh),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => fresh,
             Err(e) => return Err(io("reading", &path, e)),
         };
