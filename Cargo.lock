@@ -4019,6 +4019,25 @@ dependencies = [
  "weirdnet-keys",
  "weirdnet-net",
  "weirdnet-sync 0.7.1",
+ "weirdnet-sync 0.8.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zeroize",
+]
+
+[[package]]
+name = "weirdnet-sync"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fba289c3bb5c1d86bc07d1b4424ea5129d0eccea77838f03a5dc40ec6de522e0"
+dependencies = [
+ "blake3",
+ "cbor4ii",
+ "getrandom 0.3.4",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "weirdnet-keys",
+ "weirdnet-net",
  "zeroize",
 ]
 

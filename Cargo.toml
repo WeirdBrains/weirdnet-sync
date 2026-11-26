@@ -29,3 +29,5 @@ zeroize = "1"
 tempfile = "3"
 # Wire and record compatibility tests against the published 0.7.1.
 weirdnet-sync-07 = { package = "weirdnet-sync", version = "=0.7.1" }
+# Wire compatibility of 0.8.3 chains, key exports and scoped envelopes with the published 0.8.2.
+weirdnet-sync-082 = { package = "weirdnet-sync", version = "=0.8.2" }
