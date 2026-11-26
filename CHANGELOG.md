@@ -6,6 +6,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-11-26
+
 ### Security
 
 - Service devices with sync types now hold type-scoped keys for their granted types only, never an epoch key: in the link bundle, in admissions after a rotation, and after loading epoch keys an older device handed them. A device granted `ymir.train` can no longer open `ymir.context` pages or sealed records.
@@ -168,7 +170,8 @@ Releases as 0.7.0 (breaking: `SyncState::seed` is an `Option`, `Roster` and `Key
 
 - HLC, op log, LWW registers, OR-sets, tombstone GC, SyncKey page sealing, roster / self-cert / revocation, and the `weirdnet-sync/v1` protocol over `weirdnet-net` 0.6.0.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.7.0...v0.8.0
