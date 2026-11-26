@@ -2,6 +2,21 @@
 
 Running log for [weirdnet-sync](https://github.com/WeirdBrains/weirdnet-sync), newest first. Shared rules: the collective `AGENTS.md` of [Weird Brains](https://weirdbrains.com) projects.
 
+## 2026-11-26: type-scoped record keys for service devices (for 0.8.4)
+
+What changed: [`c757c60`](https://github.com/WeirdBrains/weirdnet-sync/commit/c757c604beb514d5c9d9e0286a27b8abbd4b2fb3) (code), [`05ccdce`](https://github.com/WeirdBrains/weirdnet-sync/commit/05ccdce24d7b1546b54ed8bcaeddc4f381747d9a) (tests), [`3f4f881`](https://github.com/WeirdBrains/weirdnet-sync/commit/3f4f881b1f77811e3ed774d37c0efb1294440d55) (README, CHANGELOG). Fixes a 0.8.3 regression reported for Ymir: a service device granted a sealed type (`ymir.context`, `RecordOptions { sealed: true }`) opened its pages but could not read or write its records, because record keys came only from the epoch key.
+
+- New record-key scheme under the type's `SyncKey` of the rotation: `scoped_record_key` (`HKDF-SHA256(SyncKey(type), salt = user id, info = weirdnet-sync/v1/record-scoped/<type>/e<n>/k<id>/<record id>)`), `scoped_record_aad` (own label), `seal_record_scoped`, `open_record_scoped`. A service device holds that key for its granted types; a full device derives it from the epoch key (`EpochKeys::sync_key`).
+- Sealing rule (`SyncState::seals_scoped`): a service device always seals type-scoped. A full device seals type-scoped while an active service device is granted the type (`Roster::service_granted`), and with the epoch key otherwise, so 0.7.1 to 0.8.3 devices keep reading records no service device shares (the 0.7.1 compatibility test stays byte-identical).
+- No wire marker: `SealInfo` is unchanged (adding a field would break semver). A full device tries both keys, the one it would seal with first; a service device has only the type-scoped key and gets a `Crypto` error for a record under the epoch key.
+- `reseal_stale` re-seals records under an older rotation and, new, records under the head that use the other scheme than a write would now. Run it on a full device after granting a service device a sealed type, so records written before the grant open there; after the last such service device is revoked it moves them back to the epoch key. A service device never re-seals records under the epoch key.
+
+Checks run: `cargo fmt --check`; `cargo clippy --all-targets` (default and all features, `-D warnings`); `cargo test` (default, all and no default features: 104 tests each, including 3 new sealed-record tests and a new 0.8.2 record-seal compatibility test; the 0.7.1 and 0.8.2 compatibility tests pass); `cargo doc --no-deps` with `-D warnings`; `cargo semver-checks` against 0.8.3 (no semver update required). weirdnet-agent 0.5.6 (`jobs,pool,serve` and all features, 124 tests) and weirdnet-backends 0.4.7 (`node` and all features, 47 tests) pass against this tree, and a graph with both resolves to one weirdnet-sync.
+
+Not tested: a real network or many devices; a full device on 0.8.3 or older can't open records sealed type-scoped (upgrade every full device that reads a type shared with a service device); a revoked service device that has not seen the rotation can still write under the rotation it held (peers refuse its sessions).
+
+Next: release 0.8.4 once CI is green; Ymir runs `reseal_stale("ymir.context")` on a full device after linking an inference node.
+
 ## 2026-11-26: released v0.8.3
 
 What changed: [`d0bfe9d`](https://github.com/WeirdBrains/weirdnet-sync/commit/d0bfe9dc32a22e0154d38b1a2e63a7c5e2e2cc3e) (`release: v0.8.3`, tag [`v0.8.3`](https://github.com/WeirdBrains/weirdnet-sync/releases/tag/v0.8.3)), published as [weirdnet-sync 0.8.3](https://crates.io/crates/weirdnet-sync/0.8.3) ([docs.rs](https://docs.rs/weirdnet-sync/0.8.3)) with the shared release script. The first upload got a crates.io 500; `crates --tag v0.8.3` published it.
