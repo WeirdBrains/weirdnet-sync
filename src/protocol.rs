@@ -8,7 +8,7 @@ use crate::hlc::{Hlc, NodeId};
 use crate::log::{LogEntry, Page as LogPage};
 use crate::roster::DeviceGrant;
 use crate::rotation::KeyChain;
-use crate::seal::{open_page, page_aad_keyed, rotated_sync_key, seal_page, sync_key};
+use crate::seal::{SyncKey, open_page, page_aad_keyed, rotated_sync_key, seal_page, sync_key};
 use serde::{Deserialize, Serialize};
 use weirdnet_keys::{Key32, Sealed};
 use weirdnet_net::profile::{Profile, WEIRDNET};
@@ -188,15 +188,29 @@ impl Envelope {
     /// Seal under a rotated epoch key (rotation `id`).
     pub fn seal_keyed(epoch_key: &Key32, id: &str, user_id: &str, typ: &str, epoch: u32, asking_peer: &str, msg: &Message) -> Result<Self> {
         let key = rotated_sync_key(epoch_key, user_id, typ, epoch, id)?;
-        let plain = encode(msg)?;
-        let sealed = weirdnet_keys::seal(&key, &plain, &page_aad_keyed(typ, epoch, id, asking_peer))?;
-        Ok(Self { typ: typ.into(), epoch, key: Some(id.into()), sealed, clear: false })
+        Self::seal_scoped(&key, id, typ, epoch, asking_peer, msg)
     }
 
     pub fn open_keyed(&self, epoch_key: &Key32, user_id: &str, asking_peer: &str) -> Result<Message> {
         let id = self.key.as_deref().ok_or_else(|| SyncError::Crypto("not sealed under a rotated key".into()))?;
         let key = rotated_sync_key(epoch_key, user_id, &self.typ, self.epoch, id)?;
-        let plain: Zeroizing<Vec<u8>> = weirdnet_keys::open(&key, &self.sealed, &page_aad_keyed(&self.typ, self.epoch, id, asking_peer))?;
+        self.open_scoped(&key, asking_peer)
+    }
+
+    /// Seal under a type-scoped key (since 0.8.3): `typ`'s [`SyncKey`] under rotation `id`,
+    /// as [`rotated_sync_key`] derives it from the epoch key and as a service device holds
+    /// it ([`crate::EpochKeys::get_scoped`]). The envelope is byte-for-byte the shape
+    /// [`Envelope::seal_keyed`] makes, so either side may hold the epoch key or the scoped key.
+    pub fn seal_scoped(key: &SyncKey, id: &str, typ: &str, epoch: u32, asking_peer: &str, msg: &Message) -> Result<Self> {
+        let plain = Zeroizing::new(encode(msg)?);
+        let sealed = weirdnet_keys::seal(key, &plain, &page_aad_keyed(typ, epoch, id, asking_peer))?;
+        Ok(Self { typ: typ.into(), epoch, key: Some(id.into()), sealed, clear: false })
+    }
+
+    /// Open an envelope sealed under a rotated key with its type-scoped key (since 0.8.3).
+    pub fn open_scoped(&self, key: &SyncKey, asking_peer: &str) -> Result<Message> {
+        let id = self.key.as_deref().ok_or_else(|| SyncError::Crypto("not sealed under a rotated key".into()))?;
+        let plain: Zeroizing<Vec<u8>> = weirdnet_keys::open(key, &self.sealed, &page_aad_keyed(&self.typ, self.epoch, id, asking_peer))?;
         decode(&plain)
     }
 

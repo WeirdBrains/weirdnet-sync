@@ -26,10 +26,14 @@
 //!   member. The head is the valid rotation with the highest epoch, then one with no
 //!   revoked member, then the lowest id. A head with a revoked member needs another
 //!   rotation; [`crate::pull_from`] makes it.
+//! - A service device with sync types is never sealed the epoch key (since 0.8.3): the
+//!   rotation's creator admits it with the new rotation's type-scoped keys for its grant
+//!   ([`Roster::scoped_types`], [`EpochKeys::get_scoped`]), so it can open only those types.
 use crate::error::{Result, SyncError};
 use crate::net::SyncState;
 use crate::protocol::{decode, encode};
 use crate::roster::Roster;
+use crate::seal::{SyncKey, rotated_sync_key};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use weirdnet_keys::exchange::{self, ExchangeSecret};
@@ -490,56 +494,153 @@ impl Roster {
 
 /// The epoch keys this device holds, by rotation id. Secret: the application stores it
 /// encrypted ([`EpochKeys::export`]) and never logs it.
+///
+/// Since 0.8.3 it may also hold type-scoped keys: one type's [`SyncKey`] under one rotation,
+/// by (rotation id, type). A service device holds only those, for the types in its grant
+/// ([`Roster::scoped_types`]), never an epoch key, so it can open no other type's pages and
+/// no sealed record. Every key is zeroized on drop.
 #[derive(Clone, Default, PartialEq)]
 pub struct EpochKeys {
     keys: BTreeMap<String, (u32, Key32)>,
+    scoped: BTreeMap<(String, String), (u32, SyncKey)>,
 }
 
 impl std::fmt::Debug for EpochKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EpochKeys({} keys)", self.keys.len())
+        if self.scoped.is_empty() {
+            write!(f, "EpochKeys({} keys)", self.keys.len())
+        } else {
+            write!(f, "EpochKeys({} keys, {} scoped)", self.keys.len(), self.scoped.len())
+        }
     }
 }
 
+/// One stored key. `typ` (since 0.8.3) marks a type-scoped key; left off the wire for an
+/// epoch key, so 0.8.0 to 0.8.2 read exports and admissions of epoch keys unchanged.
 #[derive(Serialize, Deserialize)]
 struct KeyEntry {
     id: String,
     epoch: u32,
     key: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    typ: Option<String>,
 }
 
 impl EpochKeys {
     pub fn new() -> Self {
         Self::default()
     }
+    /// The epoch key of rotation `id`. `None` for a rotation held only as type-scoped keys.
     pub fn get(&self, id: &str) -> Option<&Key32> {
         self.keys.get(id).map(|(_, k)| k)
     }
+    /// Whether any key of rotation `id` is held: its epoch key or a type-scoped key.
     pub fn has(&self, id: &str) -> bool {
+        self.keys.contains_key(id) || self.scoped_types(id).next().is_some()
+    }
+    /// Whether the epoch key of rotation `id` is held (since 0.8.3).
+    pub fn has_epoch_key(&self, id: &str) -> bool {
         self.keys.contains_key(id)
     }
     pub fn insert(&mut self, id: String, epoch: u32, key: Key32) {
         self.keys.insert(id, (epoch, key));
     }
+    /// The type-scoped key of `typ` under rotation `id` (since 0.8.3).
+    pub fn get_scoped(&self, id: &str, typ: &str) -> Option<&SyncKey> {
+        self.scoped.get(&(id.to_string(), typ.to_string())).map(|(_, k)| k)
+    }
+    /// Hold `typ`'s key under rotation `id` (since 0.8.3).
+    pub fn insert_scoped(&mut self, id: String, typ: String, epoch: u32, key: SyncKey) {
+        self.scoped.insert((id, typ), (epoch, key));
+    }
+    /// The types held as scoped keys under rotation `id` (since 0.8.3).
+    pub fn scoped_types<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.scoped.range((id.to_string(), String::new())..).take_while(move |((i, _), _)| i == id).map(|((_, t), _)| t.as_str())
+    }
+    /// Every key held: epoch keys and type-scoped keys.
     pub fn len(&self) -> usize {
+        self.keys.len() + self.scoped.len()
+    }
+    /// Epoch keys held (since 0.8.3). Always 0 on a service device.
+    pub fn epoch_key_count(&self) -> usize {
         self.keys.len()
     }
+    /// Type-scoped keys held (since 0.8.3).
+    pub fn scoped_len(&self) -> usize {
+        self.scoped.len()
+    }
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.keys.is_empty() && self.scoped.is_empty()
     }
+    /// The rotations held, with their epochs (an epoch key or any scoped key).
     pub fn ids(&self) -> impl Iterator<Item = (&str, u32)> {
-        self.keys.iter().map(|(id, (e, _))| (id.as_str(), *e))
+        let mut all: BTreeMap<&str, u32> = self.keys.iter().map(|(id, (e, _))| (id.as_str(), *e)).collect();
+        for ((id, _), (e, _)) in &self.scoped {
+            all.entry(id.as_str()).or_insert(*e);
+        }
+        all.into_iter()
     }
+    /// `typ`'s [`SyncKey`] under rotation `id` at `epoch` (since 0.8.3): derived from the
+    /// epoch key when held ([`rotated_sync_key`]), otherwise the scoped key.
+    pub fn sync_key(&self, user_id: &str, typ: &str, epoch: u32, id: &str) -> Result<SyncKey> {
+        if let Some((_, k)) = self.keys.get(id) {
+            return rotated_sync_key(k, user_id, typ, epoch, id);
+        }
+        match self.scoped.get(&(id.to_string(), typ.to_string())) {
+            Some((e, k)) if *e == epoch => Ok(k.clone()),
+            Some(_) => Err(crypto("the scoped key is for another epoch")),
+            None if self.has(id) => Err(crypto("no key for this type under this rotation")),
+            None => Err(crypto("unknown epoch key")),
+        }
+    }
+    /// Type-scoped keys for `types` under every rotation held (since 0.8.3): derived from the
+    /// epoch keys, plus scoped keys already held for those types. Holds no epoch key: what a
+    /// service device is given.
+    pub fn scope(&self, user_id: &str, types: &[String]) -> Result<EpochKeys> {
+        self.scope_where(user_id, types, |_| true)
+    }
+
+    fn scope_where(&self, user_id: &str, types: &[String], only: impl Fn(&str) -> bool) -> Result<EpochKeys> {
+        let mut out = EpochKeys::new();
+        for (id, (epoch, key)) in self.keys.iter().filter(|(id, _)| only(id)) {
+            for t in types {
+                out.scoped.insert((id.clone(), t.clone()), (*epoch, rotated_sync_key(key, user_id, t, *epoch, id)?));
+            }
+        }
+        for ((id, t), v) in &self.scoped {
+            if only(id) && types.contains(t) {
+                out.scoped.entry((id.clone(), t.clone())).or_insert_with(|| v.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Replace every epoch key with type-scoped keys for `types`, and drop scoped keys of
+    /// other types (since 0.8.3): what a service device keeps.
+    pub fn narrow_to(&mut self, user_id: &str, types: &[String]) -> Result<()> {
+        *self = self.scope(user_id, types)?;
+        Ok(())
+    }
+
     /// Take keys held by another copy of this state (keys are never dropped).
     pub fn merge(&mut self, other: &EpochKeys) {
         for (id, v) in &other.keys {
             self.keys.entry(id.clone()).or_insert_with(|| v.clone());
         }
+        for (k, v) in &other.scoped {
+            self.scoped.entry(k.clone()).or_insert_with(|| v.clone());
+        }
     }
 
     fn entries(&self, only: impl Fn(&str) -> bool) -> Zeroizing<Vec<u8>> {
         let mut list: Vec<KeyEntry> =
-            self.keys.iter().filter(|(id, _)| only(id)).map(|(id, (e, k))| KeyEntry { id: id.clone(), epoch: *e, key: k.0 }).collect();
+            self.keys.iter().filter(|(id, _)| only(id)).map(|(id, (e, k))| KeyEntry { id: id.clone(), epoch: *e, key: k.0, typ: None }).collect();
+        list.extend(self.scoped.iter().filter(|((id, _), _)| only(id)).map(|((id, t), (e, k))| KeyEntry {
+            id: id.clone(),
+            epoch: *e,
+            key: k.0,
+            typ: Some(t.clone()),
+        }));
         let out = Zeroizing::new(encode(&list).unwrap_or_default());
         for e in &mut list {
             e.key.zeroize();
@@ -547,15 +648,24 @@ impl EpochKeys {
         out
     }
 
-    fn absorb(&mut self, bytes: &[u8], accept: impl Fn(&str, &Key32) -> bool) -> Result<usize> {
+    /// Take the keys in `bytes` that `accept(id, epoch, typ, key)` allows (`typ` is `None`
+    /// for an epoch key) and that are not held yet.
+    fn absorb(&mut self, bytes: &[u8], accept: impl Fn(&str, u32, Option<&str>, &Key32) -> bool) -> Result<usize> {
         let mut list: Vec<KeyEntry> = decode(bytes)?;
         let mut n = 0;
         for e in &mut list {
             let key = Key32(e.key);
             e.key.zeroize();
-            if !self.has(&e.id) && accept(&e.id, &key) {
-                self.keys.insert(e.id.clone(), (e.epoch, key));
-                n += 1;
+            match e.typ.take() {
+                None if !self.keys.contains_key(&e.id) && accept(&e.id, e.epoch, None, &key) => {
+                    self.keys.insert(e.id.clone(), (e.epoch, key));
+                    n += 1;
+                }
+                Some(t) if !self.scoped.contains_key(&(e.id.clone(), t.clone())) && accept(&e.id, e.epoch, Some(&t), &key) => {
+                    self.scoped.insert((e.id.clone(), t), (e.epoch, key));
+                    n += 1;
+                }
+                _ => {}
             }
         }
         Ok(n)
@@ -568,7 +678,7 @@ impl EpochKeys {
 
     pub fn import(bytes: &[u8]) -> Result<Self> {
         let mut k = Self::new();
-        k.absorb(bytes, |_, _| true)?;
+        k.absorb(bytes, |_, _, _, _| true)?;
         Ok(k)
     }
 }
@@ -688,7 +798,7 @@ impl SyncState {
         let views = self.roster.all_views();
         let valid = |id: &str| views.iter().any(|v| v.valid.contains_key(id));
         let mut n = 0;
-        let checks: BTreeMap<String, String> = self.roster.chain.rotations.iter().map(|r| (r.id(), r.check.clone())).collect();
+        let checks: BTreeMap<String, (u32, String)> = self.roster.chain.rotations.iter().map(|r| (r.id(), (r.epoch, r.check.clone()))).collect();
         for r in &self.roster.chain.rotations {
             let id = r.id();
             if !valid(&id) || self.keys.has(&id) {
@@ -708,9 +818,20 @@ impl SyncState {
                 continue;
             }
             if let Ok(plain) = open_from(&device.exchange, &a.eph, &a.transcript(&my_pub), &a.sealed) {
-                n += self.keys.absorb(&plain, |id, key| valid(id) && checks.get(id).is_some_and(|c| *c == key_check(key))).unwrap_or(0);
+                // An epoch key must match its rotation's commitment. A type-scoped key (a
+                // service device's) cannot be checked against it; it counts for the
+                // admission's rotation epoch, sealed and signed by a member.
+                let accept = |id: &str, epoch: u32, typ: Option<&str>, key: &Key32| {
+                    valid(id)
+                        && checks.get(id).is_some_and(|(e, c)| match typ {
+                            None => *c == key_check(key),
+                            Some(_) => *e == epoch,
+                        })
+                };
+                n += self.keys.absorb(&plain, accept).unwrap_or(0);
             }
         }
+        self.narrow_keys();
         if self.roster.chain.root.is_none()
             && let Some(root) = &view.root
             && view.valid.keys().any(|id| self.keys.has(id))
@@ -769,8 +890,18 @@ impl SyncState {
         if !recipients.contains(&me) {
             recipients.push(me.clone());
         }
+        // Service devices with sync types never get the epoch key: they are admitted to the
+        // new rotation with type-scoped keys below (the scoped keys bind the rotation id,
+        // which is only known once the rotation is signed).
+        let mut scoped = Vec::new();
         for peer in recipients {
             let Some(public) = self.roster.chain.device(&peer).and_then(DeviceKey::public) else { continue };
+            if peer != me
+                && let Some(types) = self.roster.scoped_types(&peer)
+            {
+                scoped.push((peer, public, types));
+                continue;
+            }
             let sealed = seal_to(&eph, &public, &r.transcript(&peer, &public), &key.0)?;
             r.keys.push(SealedKey { peer_id: peer, sealed });
         }
@@ -782,6 +913,10 @@ impl SyncState {
         self.roster.chain.rotations.push(r);
         self.keys.insert(id.clone(), epoch, key);
         self.roster.epoch = self.roster.epoch.max(epoch);
+        for (peer, public, types) in scoped {
+            let plain = self.keys.scope_where(&self.user_id, &types, |k| k == id)?.entries(|_| true);
+            self.push_admission(&device, &id, &peer, &public, &plain, at_ms)?;
+        }
         Ok(id)
     }
 
@@ -904,21 +1039,54 @@ impl SyncState {
             .device(&peer)
             .and_then(DeviceKey::public)
             .ok_or_else(|| SyncError::Protocol(format!("no device key for {peer} yet")))?;
+        // A service device with sync types gets type-scoped keys for its grant, never the
+        // epoch keys.
+        let plain = match self.roster.scoped_types(&peer) {
+            Some(types) => self.keys.scope_where(&self.user_id, &types, |id| view.valid.contains_key(id))?.entries(|_| true),
+            None => self.keys.entries(|id| view.valid.contains_key(id)),
+        };
+        self.push_admission(&device, &head.id, &peer, &public, &plain, at_ms)?;
+        Ok(true)
+    }
+
+    /// Seal `plain` (key entries) to `peer` as an admission to `rotation`, signed by `device`.
+    fn push_admission(&mut self, device: &Device, rotation: &str, peer: &str, public: &[u8; 32], plain: &[u8], at_ms: i64) -> Result<()> {
         let eph = ExchangeSecret::generate();
         let mut a = Admission {
-            rotation: head.id.clone(),
-            peer_id: peer,
+            rotation: rotation.to_string(),
+            peer_id: peer.to_string(),
             by: device.peer_id(),
             at_ms,
             eph: hex::encode(eph.public()),
             sealed: Sealed { nonce: String::new(), ct: String::new() },
             sig: Vec::new(),
         };
-        let plain = self.keys.entries(|id| view.valid.contains_key(id));
-        a.sealed = seal_to(&eph, &public, &a.transcript(&public), &plain)?;
+        a.sealed = seal_to(&eph, public, &a.transcript(public), plain)?;
         a.sig = device.sign(&a.body())?;
         self.roster.chain.admissions.push(a);
-        Ok(true)
+        Ok(())
+    }
+
+    /// On a service device, keep only type-scoped keys for the types in its grant: an
+    /// epoch key that reached it (from a 0.8.2 device's link or rotation) is replaced by
+    /// the scoped keys it allows, and dropped.
+    pub(crate) fn narrow_keys(&mut self) {
+        if !self.is_service() {
+            return;
+        }
+        let Some(types) = self.roster.scoped_types(&self.our_cert.peer_id) else {
+            if self.roster.grant_of(&self.our_cert.peer_id).is_some_and(crate::roster::DeviceGrant::roster_only) {
+                self.keys = EpochKeys::new();
+            }
+            return;
+        };
+        if self.keys.epoch_key_count() == 0 && self.keys.ids().all(|(id, _)| self.keys.scoped_types(id).all(|t| types.iter().any(|x| x == t))) {
+            return;
+        }
+        let user_id = self.user_id.clone();
+        if self.keys.narrow_to(&user_id, &types).is_err() {
+            self.keys = EpochKeys::new();
+        }
     }
 }
 

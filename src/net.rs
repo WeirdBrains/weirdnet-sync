@@ -150,7 +150,9 @@ impl SyncState {
 
     /// What a service link to `peer_id` carries for sync (see [`LinkBundle`]): a service
     /// grant with `roles` and `types` (kept in this roster too), the roster, and, when
-    /// `types` is not empty, the epoch keys this device holds. With types and no rotation
+    /// `types` is not empty, type-scoped keys for those types (their chunk types and
+    /// [`LEASE_TYPE`](crate::lease::LEASE_TYPE)) under every rotation this device holds; since
+    /// 0.8.3 never an epoch key (see [`Roster::scoped_types`]). With types and no rotation
     /// yet, this rotates first, so a service device never needs a seed-derived key. Needs
     /// the seed. After the link, [`SyncState::approve`] the node's certificate as usual.
     pub fn service_bundle(&mut self, peer_id: &str, roles: &[String], types: &[String], at_ms: i64) -> Result<LinkBundle> {
@@ -164,7 +166,8 @@ impl SyncState {
             if !matches!(self.key_status(), KeyStatus::Current { .. }) {
                 return Err(SyncError::Refused("needs-admission".into()));
             }
-            Some(self.keys.export().to_vec())
+            let types = grant.scoped_types().unwrap_or_default();
+            Some(self.keys.scope(&self.user_id, &types)?.export().to_vec())
         };
         let mut roster = self.roster.clone();
         roster.chain = roster.chain.shared();
@@ -189,9 +192,11 @@ impl SyncState {
                 Some(seed) => Envelope::seal(seed, &self.user_id, typ, key.epoch, peer, msg),
                 None => Err(SyncError::Crypto("no epoch key yet (a service device has no seed-derived key)".into())),
             },
+            // The epoch key when held, otherwise the type-scoped key (a service device):
+            // the same SyncKey either way, so the envelope is the same.
             Some(id) => {
-                let k = self.keys.get(id).ok_or_else(|| SyncError::Crypto("unknown epoch key".into()))?;
-                Envelope::seal_keyed(k, id, &self.user_id, typ, key.epoch, peer, msg)
+                let k = self.keys.sync_key(&self.user_id, typ, key.epoch, id)?;
+                Envelope::seal_scoped(&k, id, typ, key.epoch, peer, msg)
             }
         }
     }
@@ -206,8 +211,8 @@ impl SyncState {
                 None => Err(SyncError::Crypto("seed-sealed envelope on a service device".into())),
             },
             Some(id) => {
-                let k = self.keys.get(id).ok_or_else(|| SyncError::Crypto("unknown epoch key".into()))?;
-                env.open_keyed(k, &self.user_id, peer)
+                let k = self.keys.sync_key(&self.user_id, &env.typ, env.epoch, id)?;
+                env.open_scoped(&k, peer)
             }
         }
     }
@@ -238,10 +243,11 @@ impl SyncState {
     fn merge_keys(&mut self, other: &SyncState) -> usize {
         let before = self.keys.len();
         self.keys.merge(&other.keys);
+        self.narrow_keys();
         if self.roster.chain.root.is_none() {
             self.roster.chain.root = other.roster.chain.root.clone();
         }
-        self.keys.len() - before
+        self.keys.len().saturating_sub(before)
     }
 
     /// A copy of this state to pull into without holding the shared lock (see
@@ -328,6 +334,10 @@ impl SyncState {
             Ok(m) => m,
             // Sealed under a rotation we don't hold: we are behind. Say so under the seed
             // key, so the asker sends us its roster.
+            // A service device holding the rotation but not this type's key: not granted.
+            Err(_) if env.key.as_deref().is_some_and(|id| self.is_service() && self.keys.has(id)) => {
+                return self.refuse(from, &env.typ, env.epoch, "type-not-granted");
+            }
             Err(_) if env.key.is_some() => return self.refuse(from, &env.typ, env.epoch, "unknown-key"),
             Err(_) => return self.refuse(from, &env.typ, env.epoch, "wrong-user"),
         };
@@ -335,7 +345,14 @@ impl SyncState {
         // After a rotation only the head key carries data; older and seed-derived keys
         // (which a revoked device may hold) only get the roster.
         let at_head = head.is_none() || env.key == head;
+        // A service peer syncs only the types in its grant, and leases (since 0.8.3). Its
+        // scoped keys already keep it from sealing anything else; this also holds for one
+        // linked by an older device, which may hold epoch keys.
+        let granted = |t: &str| self.roster.may_sync(from, t);
         let reply = match msg {
+            Message::Hello(_) | Message::Pull(_) | Message::Ack(_) if !granted(&env.typ) => Message::Refuse(Refuse::new("type-not-granted")),
+            Message::Pull(ref p) if !granted(&p.typ) => Message::Refuse(Refuse::new("type-not-granted")),
+            Message::LeaseAsk(_) | Message::LeaseFree(_) if !granted(crate::lease::LEASE_TYPE) => Message::Refuse(Refuse::new("type-not-granted")),
             Message::Hello(h) => self.on_hello(from, h, at_head),
             Message::Pull(_) if !at_head => Message::Refuse(Refuse::new("epoch-behind")),
             Message::Pull(_) if self.is_revoked(from) => Message::Refuse(Refuse::new("revoked")),
@@ -391,7 +408,13 @@ impl SyncState {
         Envelope::clear(&env.typ, env.epoch, &reply)
     }
 
-    fn on_hello(&mut self, _from: &str, h: Hello, at_head: bool) -> Message {
+    fn on_hello(&mut self, from: &str, mut h: Hello, at_head: bool) -> Message {
+        // Only the types the peer may sync count (all of them for a full device).
+        let offered = h.types.len();
+        h.types.retain(|t| self.roster.may_sync(from, t));
+        if offered > 0 && h.types.is_empty() {
+            return Message::Refuse(Refuse::new("type-not-granted"));
+        }
         let rotated = self.roster.head_id().is_some();
         // After a rotation the key decides who is current, not the epoch number.
         let epoch = if rotated { self.roster.epoch } else { h.epoch };

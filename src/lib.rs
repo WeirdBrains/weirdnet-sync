@@ -27,7 +27,8 @@ pub use hlc::{Hlc, NodeId};
 pub use identity::{FileSecrets, Identity, LinkSettings, SecretStore, Tick};
 pub use jobs::{JobEvent, JobRules, JobSpec, JobStatus, JobView, Jobs, MAX_JOB_CLAIM, job_lease};
 pub use lease::{
-    Elector, FenceGuard, LeaseConfig, LeaseError, LeaseHandle, LeaseLimits, LeaseName, LeaseRecord, LeaseState, Leases, Stale, Term, Voter, Voters,
+    Elector, FenceGuard, LEASE_TYPE, LeaseConfig, LeaseError, LeaseHandle, LeaseLimits, LeaseName, LeaseRecord, LeaseState, Leases, Stale, Term,
+    Voter, Voters,
 };
 pub use log::{LogEntry, OpLog, Page as LogPage};
 pub use merge::{CONFLICT_KEEP_MS, Lww, OrSet, TOMBSTONE_GC_MS, can_gc_tombstone, edit_vs_delete, folder_cycle, lww};

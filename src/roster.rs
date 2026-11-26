@@ -103,6 +103,29 @@ impl DeviceGrant {
         self.roles.iter().any(|r| r == role)
     }
 
+    /// The sync types a service device with this grant holds type-scoped keys for instead
+    /// of the epoch keys (since 0.8.3): its granted types, their chunk types
+    /// ([`crate::chunk_type`]) and [`LEASE_TYPE`](crate::lease::LEASE_TYPE), which every
+    /// service device with sync types gets so it can vote and stand for leases (grant only
+    /// `weirdnet.lease` for a lease-only device). `None` for a full device (it holds the
+    /// epoch keys) and for a roster-only one (no keys).
+    pub fn scoped_types(&self) -> Option<Vec<String>> {
+        if self.class != DeviceClass::Service || self.roster_only() {
+            return None;
+        }
+        let mut out: Vec<String> = Vec::with_capacity(self.types.len() * 2 + 1);
+        for t in &self.types {
+            out.push(t.clone());
+            if t != crate::lease::LEASE_TYPE {
+                out.push(crate::record::chunk_type(t));
+            }
+        }
+        out.push(crate::lease::LEASE_TYPE.to_string());
+        out.sort();
+        out.dedup();
+        Some(out)
+    }
+
     /// A service device with no sync types: it gets the roster but no data keys.
     pub fn roster_only(&self) -> bool {
         self.class == DeviceClass::Service && self.types.is_empty()
@@ -213,6 +236,29 @@ impl Roster {
     /// device.
     pub fn holds_keys(&self, peer_id: &str) -> bool {
         !self.grant_of(peer_id).is_some_and(DeviceGrant::roster_only)
+    }
+
+    /// The sync types `peer_id` holds type-scoped keys for instead of the epoch keys
+    /// (since 0.8.3; see [`DeviceGrant::scoped_types`]), while its cert is active. `None`
+    /// for every other device: a full device holds the epoch keys, a roster-only one none.
+    pub fn scoped_types(&self, peer_id: &str) -> Option<Vec<String>> {
+        self.grant_of(peer_id)?.scoped_types()
+    }
+
+    /// Whether `peer_id` may sync `typ` with this device (since 0.8.3): every device may,
+    /// except a service device, which may sync only the types in its grant (and their
+    /// chunk types) plus [`LEASE_TYPE`](crate::lease::LEASE_TYPE), and nothing when its
+    /// grant is roster-only. Checked on every hello, pull, ack and lease request.
+    pub fn may_sync(&self, peer_id: &str, typ: &str) -> bool {
+        let Some(g) = self.grants.iter().find(|g| g.peer_id == peer_id) else { return true };
+        if g.class != DeviceClass::Service {
+            return true;
+        }
+        if g.roster_only() {
+            return false;
+        }
+        let base = crate::record::base_type(typ).unwrap_or(typ);
+        typ == crate::lease::LEASE_TYPE || g.types.iter().any(|t| t == typ || t == base)
     }
 
     /// When `peer_id`'s grant made it a service device (one grant is held per device), for
