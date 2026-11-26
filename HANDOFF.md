@@ -2,6 +2,16 @@
 
 Running log for [weirdnet-sync](https://github.com/WeirdBrains/weirdnet-sync), newest first. Shared rules: the collective `AGENTS.md` of [Weird Brains](https://weirdbrains.com) projects.
 
+## 2026-11-26: released v0.8.5
+
+What changed: [`8fc693e`](https://github.com/WeirdBrains/weirdnet-sync/commit/8fc693e06daeaeef1a7b1e43aa5fbfab64b24c4b) (`release: v0.8.5`, tag [`v0.8.5`](https://github.com/WeirdBrains/weirdnet-sync/releases/tag/v0.8.5)), published as [weirdnet-sync 0.8.5](https://crates.io/crates/weirdnet-sync/0.8.5) ([docs.rs](https://docs.rs/weirdnet-sync/0.8.5)) with the shared release script (`--patch`).
+
+Checks run: CI green on Linux, macOS and Windows for the change and the release commit; the release script's checks; `cargo semver-checks` against 0.8.4 (no breaking changes). docs.rs built 0.8.5. The site ([net.weirdbrains.com](https://net.weirdbrains.com/crates/sync)) shows 0.8.5.
+
+Not tested: see the entry below.
+
+Next: weirdnet-agent and Bragi can move their per-type pull loops onto `pull_types`.
+
 ## 2026-11-26: several types in one sync session (for 0.8.5)
 
 What changed: [`fb83317`](https://github.com/WeirdBrains/weirdnet-sync/commit/fb8331750c85c29e6850d2f017c5d95726164103) (code), [`6c17f58`](https://github.com/WeirdBrains/weirdnet-sync/commit/6c17f58e722c9bd291482e6bbeab2931137335df) (tests), plus this commit (README, CHANGELOG). Asked for Bragi and Ymir, which pulled each record type in its own session.
