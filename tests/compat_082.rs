@@ -66,3 +66,30 @@ fn a_0_8_2_full_device_reads_0_8_3_chains_keys_and_scoped_envelopes() {
     let ne: weirdnet_sync::Envelope = weirdnet_sync::decode(&old::encode(&back).unwrap()).unwrap();
     assert_eq!(s.open_envelope(&ne, &peer(&ks)).unwrap(), pull);
 }
+
+#[test]
+fn records_sealed_with_the_epoch_key_cross_0_8_2_and_type_scoped_ones_do_not() {
+    let ka = Keypair::generate_ed25519();
+    let u = user();
+    let mut a = SyncState::new(SEED.to_vec(), u.public(), cert(&u, &ka, "phone", 1), Some(&ka), vec![TRAIN.into()]).unwrap();
+    a.auto_first_rotation = false;
+    a.rotate(2).unwrap();
+    let key = a.current_key();
+    let id = key.id.clone().unwrap();
+    let ek = a.keys.get(&id).unwrap();
+    let r = weirdnet_sync::RecordRef { typ: "ymir.context", record_id: "chat-1", node: "peer-a" };
+    let or = old::RecordRef { typ: "ymir.context", record_id: "chat-1", node: "peer-a" };
+    // Epoch-key seals are the same scheme both ways.
+    let (s, ct) = weirdnet_sync::record::seal_record(ek, &a.user_id, &r, key.epoch, &id, b"hello").unwrap();
+    let os: old::SealInfo = old::decode(&encode(&s).unwrap()).unwrap();
+    assert_eq!(&old::record::open_record(ek, &a.user_id, &or, &os, &ct).unwrap()[..], b"hello");
+    let (os, oct) = old::record::seal_record(ek, &a.user_id, &or, key.epoch, &id, b"hello").unwrap();
+    let s: weirdnet_sync::SealInfo = weirdnet_sync::decode(&old::encode(&os).unwrap()).unwrap();
+    assert_eq!(&weirdnet_sync::record::open_record(ek, &a.user_id, &r, &s, &oct).unwrap()[..], b"hello");
+    // A type-scoped seal encodes the same SealInfo shape, and 0.8.2 cannot open it.
+    let tk = weirdnet_sync::rotated_sync_key(ek, &a.user_id, "ymir.context", key.epoch, &id).unwrap();
+    let (s, ct) = weirdnet_sync::seal_record_scoped(&tk, &a.user_id, &r, key.epoch, &id, b"hello").unwrap();
+    let os: old::SealInfo = old::decode(&encode(&s).unwrap()).unwrap();
+    assert_eq!(old::encode(&os).unwrap(), encode(&s).unwrap());
+    assert!(old::record::open_record(ek, &a.user_id, &or, &os, &ct).is_err());
+}
