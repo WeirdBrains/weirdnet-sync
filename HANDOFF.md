@@ -2,6 +2,21 @@
 
 Running log for [weirdnet-sync](https://github.com/WeirdBrains/weirdnet-sync), newest first. Shared rules: the collective `AGENTS.md` of [Weird Brains](https://weirdbrains.com) projects.
 
+## 2026-11-26: type-scoped keys for service devices (for 0.8.3)
+
+What changed: [`94aa8f7`](https://github.com/WeirdBrains/weirdnet-sync/commit/94aa8f7ca0ae3c22dbd5e144d6d50f16f618b64e) (code), [`d28ce72`](https://github.com/WeirdBrains/weirdnet-sync/commit/d28ce72305c395934afd4f5029499915009581e8) (tests), [`9e20eb8`](https://github.com/WeirdBrains/weirdnet-sync/commit/9e20eb8bcfad44b34ad6db8e4811fdb0cb2b419d) (README, CHANGELOG). Requested for Ymir, so cert-only model nodes can run and vote on `ymir.train` jobs without being able to read `ymir.context`.
+
+- `EpochKeys` also holds type-scoped keys by (rotation id, type), exported with an optional `typ` field (epoch-key entries encode as before). A service device with sync types gets only those: `service_bundle` sends the scoped keys of its granted types, their chunk types and `weirdnet.lease`; a rotation no longer seals the epoch key to it but admits it with the new rotation's scoped keys (the scoped key binds the rotation id, which exists only once the rotation is signed). A service device narrows any epoch key it loads (from an older device) to scoped keys.
+- `seal_envelope`/`open_envelope` use the epoch key when held and the scoped key otherwise; the envelope is identical (`Envelope::seal_scoped`/`open_scoped`).
+- `SyncState::handle` refuses a service peer's `Hello`/`Pull`/`Ack` outside its grant (also a pull of another type inside a granted type's envelope) and lease requests from roster-only devices, with `type-not-granted` (`Roster::may_sync`).
+- `weirdnet.lease` is automatic for any service device with sync types (0.8.2's lease tests already relied on that); a grant of only `weirdnet.lease` is a lease-only voter.
+
+Checks run: `cargo fmt --check`; `cargo clippy --all-targets` (default and all features, `-D warnings`); `cargo test` (default, all and no default features: 74 unit tests, 13 lease/job network tests, 5 service tests, 5 new scoped-key tests, the 0.7.1 and new 0.8.2 compatibility tests); `cargo doc --no-deps` with `-D warnings`; `cargo semver-checks` against 0.8.2 (no semver update required). weirdnet-agent 0.5.6 (`jobs,pool,serve`, 134 tests) and weirdnet-backends 0.4.7 (`node`, 61 tests) pass against this tree, and both build together with it in one graph (one weirdnet-sync).
+
+Not tested: a real network or many devices; a fleet where a 0.8.2 full device rotates (it still seals the epoch key to service devices, which then narrow it on load; upgrade full devices first). A 0.8.2 service device can't use the scoped admissions and needs 0.8.3. Changing a service device's types takes effect for its keys at the next rotation; enforcement applies at once.
+
+Next: release 0.8.3 once CI is green; Ymir grants its model nodes `ymir.train` and keeps that type unsealed.
+
 ## 2026-11-25: owner pause spares the attempt in progress (for 0.8.2)
 
 What changed: [`e1b279e`](https://github.com/WeirdBrains/weirdnet-sync/commit/e1b279ecbe263011cb5b82f288939ac084e2e927). Voters refuse to renew a paused job's claim, so a busy holder could see the owner's pause only after its lease ran out; it then could not record its own pause and the fold counted its claim as an attempt. The fold now treats the owner's pause as ending the claim in progress without an attempt (unless that term already finished or failed). Found by weirdnet-agent's `jobs` tests on a loaded runner (Windows CI, and locally with six test runs in parallel).
