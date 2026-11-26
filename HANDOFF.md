@@ -2,6 +2,16 @@
 
 Running log for [weirdnet-sync](https://github.com/WeirdBrains/weirdnet-sync), newest first. Shared rules: the collective `AGENTS.md` of [Weird Brains](https://weirdbrains.com) projects.
 
+## 2026-11-25: owner pause spares the attempt in progress (for 0.8.2)
+
+What changed: [`e1b279e`](https://github.com/WeirdBrains/weirdnet-sync/commit/e1b279ecbe263011cb5b82f288939ac084e2e927). Voters refuse to renew a paused job's claim, so a busy holder could see the owner's pause only after its lease ran out; it then could not record its own pause and the fold counted its claim as an attempt. The fold now treats the owner's pause as ending the claim in progress without an attempt (unless that term already finished or failed). Found by weirdnet-agent's `jobs` tests on a loaded runner (Windows CI, and locally with six test runs in parallel).
+
+Checks run: `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, `cargo test --all-features` (new unit test `an_owner_pause_spares_only_the_attempt_in_progress`), `cargo doc -D warnings`; weirdnet-agent's six job tests against this tree, 18 runs six at a time, all passing (before: 6 of 18 failed).
+
+Not tested: devices on 0.8.1 and 0.8.2 folding the same job can disagree on its attempt count after such a pause (status is the same); move job voters together.
+
+What's left and next: release 0.8.2; weirdnet-agent 0.5.6 locks it.
+
 ## 2026-11-25: released 0.8.1
 
 What changed: `release: v0.8.1` ([`cf8d275`](https://github.com/WeirdBrains/weirdnet-sync/commit/cf8d275e1bbb110f79a251b7a9613a273584b8a8)), annotated tag [`v0.8.1`](https://github.com/WeirdBrains/weirdnet-sync/releases/tag/v0.8.1), published to [crates.io](https://crates.io/crates/weirdnet-sync/0.8.1) with `scripts/weirdnet_release.py --patch` from weirdnet-project-helpers.
