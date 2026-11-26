@@ -2,6 +2,16 @@
 
 Running log for [weirdnet-sync](https://github.com/WeirdBrains/weirdnet-sync), newest first. Shared rules: the collective `AGENTS.md` of [Weird Brains](https://weirdbrains.com) projects.
 
+## 2026-11-26: released v0.8.4
+
+What changed: [`f02e130`](https://github.com/WeirdBrains/weirdnet-sync/commit/f02e130b31aa4847e90c956963e7c0b2b82772e9) (`release: v0.8.4`, tag [`v0.8.4`](https://github.com/WeirdBrains/weirdnet-sync/releases/tag/v0.8.4)), published as [weirdnet-sync 0.8.4](https://crates.io/crates/weirdnet-sync/0.8.4) ([docs.rs](https://docs.rs/weirdnet-sync/0.8.4)) with the shared release script (`--patch`).
+
+Checks run: CI green on Linux, macOS and Windows for the change and the release commit; the release script's checks. weirdnet-agent 0.5.6 (`jobs,pool,serve`, 124 tests) and weirdnet-backends 0.4.7 (`node`, 47 tests) pass on the published 0.8.4 and resolve with it to one weirdnet-sync. docs.rs built 0.8.4. The site ([net.weirdbrains.com](https://net.weirdbrains.com/crates/sync)) shows 0.8.4.
+
+Not tested: see the entry below.
+
+Next: nothing for this release.
+
 ## 2026-11-26: type-scoped record keys for service devices (for 0.8.4)
 
 What changed: [`c757c60`](https://github.com/WeirdBrains/weirdnet-sync/commit/c757c604beb514d5c9d9e0286a27b8abbd4b2fb3) (code), [`05ccdce`](https://github.com/WeirdBrains/weirdnet-sync/commit/05ccdce24d7b1546b54ed8bcaeddc4f381747d9a) (tests), [`3f4f881`](https://github.com/WeirdBrains/weirdnet-sync/commit/3f4f881b1f77811e3ed774d37c0efb1294440d55) (README, CHANGELOG). Fixes a 0.8.3 regression reported for Ymir: a service device granted a sealed type (`ymir.context`, `RecordOptions { sealed: true }`) opened its pages but could not read or write its records, because record keys came only from the epoch key.
