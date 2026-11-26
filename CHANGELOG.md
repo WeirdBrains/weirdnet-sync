@@ -6,6 +6,18 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `JobRules` on `JobSpec` (`with_rules`): claim candidates and a role, enforced when folding and by voters; a takeover wait after a lapsed claim; a backoff after a retryable failure (`JobView::not_before_ms`, `LeaseError::NotYet`).
+- Pausing and resuming jobs: `JobEvent::Paused` (not an attempt), `JobEvent::Resumed`, `Jobs::pause`, `Jobs::resume`, `JobStatus::Paused`.
+- Holder notes, last writer wins per key (`JobEvent::Note`, `JobView::notes`), and `JobView::owner`, `posted_ms`, `last_seen_ms`, `changed_ms`, `claimable_at`.
+- Voter limits per lease-name prefix (`Voter::with_limits`, `LeaseLimits`, `Voter::on_ask_with`); voters grant a job's own claim time up to `MAX_JOB_CLAIM` and wait out their longest grant after a restart.
+- `Leases::term_seen`.
+
+### Changed
+
+- Under `JobRules`, only the job's owner or a full device can pause, resume or cancel it. Jobs without rules behave as in 0.8.0.
+
 ## [0.8.0] - 2026-11-20
 
 Releases as 0.8.0 (breaking: `SyncState` gains a `voter` field, `Message` gains lease variants).

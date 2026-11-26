@@ -21,3 +21,13 @@ jobs:
       - run: cargo test --locked --all-features
       - run: cargo test --locked --no-default-features
       - run: cargo package --locked
+  test-os:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --all-features
