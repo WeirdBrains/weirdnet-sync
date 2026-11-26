@@ -6,6 +6,8 @@ All notable changes to weirdnet-sync are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-11-26
+
 ### Fixed
 
 - A service device granted a sealed record type (for example `ymir.context`) can read and write its records again: they are sealed under a type-scoped record key while an active service device is granted the type, and with the epoch key otherwise, so older devices keep reading records no service device shares. `reseal_stale` moves existing records to the right key.
@@ -178,7 +180,8 @@ Releases as 0.7.0 (breaking: `SyncState::seed` is an `Option`, `Roster` and `Key
 
 - HLC, op log, LWW registers, OR-sets, tombstone GC, SyncKey page sealing, roster / self-cert / revocation, and the `weirdnet-sync/v1` protocol over `weirdnet-net` 0.6.0.
 
-[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/WeirdBrains/weirdnet-sync/compare/v0.8.0...v0.8.1
